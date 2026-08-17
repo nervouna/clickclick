@@ -1,10 +1,9 @@
 import SwiftUI
 
 struct KeyboardHeatmap: View {
-    let counts: [KeyCount]
-
-    private var countMap: [HIDKeyID: Int64] { Dictionary(uniqueKeysWithValues: counts.map { ($0.key, $0.count) }) }
-    private var maximum: Double { Double(counts.filter { $0.key.isKeyboardKey }.map(\.count).max() ?? 1) }
+    let countMap: [HIDKeyID: Int64]
+    let maximum: Double
+    let mediaCounts: [KeyCount]
 
     var body: some View {
         GroupBox("物理键位热力图") {
@@ -16,11 +15,10 @@ struct KeyboardHeatmap: View {
                         }
                     }
                 }
-                let media = counts.filter { $0.key.isConsumerKey }.prefix(8)
-                if !media.isEmpty {
+                if !mediaCounts.isEmpty {
                     Divider().padding(.vertical, 6)
                     HStack {
-                        ForEach(Array(media)) { item in
+                        ForEach(mediaCounts.prefix(8)) { item in
                             VStack(spacing: 3) {
                                 Text(KeyCatalog.name(for: item.key)).lineLimit(1)
                                 Text(item.count.formatted()).font(.caption2).foregroundStyle(.secondary)
@@ -37,7 +35,8 @@ struct KeyboardHeatmap: View {
 
     private func keyCell(_ key: HIDKeyID) -> some View {
         let count = countMap[key] ?? 0
-        let intensity = count == 0 ? 0 : max(0.15, log(Double(count) + 1) / log(maximum + 1))
+        let scaleMaximum = max(maximum, 1)
+        let intensity = count == 0 ? 0 : max(0.15, log(Double(count) + 1) / log(scaleMaximum + 1))
         return VStack(spacing: 2) {
             Text(KeyCatalog.name(for: key)).lineLimit(1).minimumScaleFactor(0.55)
             if count > 0 { Text(count.formatted()).font(.system(size: 8)).foregroundStyle(.secondary) }

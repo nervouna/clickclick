@@ -2,26 +2,23 @@ import Foundation
 
 actor StatisticsEngine {
     private let store: SQLiteStore
+    private let dashboardReader: StatisticsReader
+    nonisolated let reader: StatisticsReader
+
     private var pending: [PendingKey: Int64] = [:]
     private var connectedReferences: [UInt64: UUID] = [:]
-    private var flushTask: Task<Void, Never>?
 
     init(databaseURL: URL) throws {
         store = try SQLiteStore(url: databaseURL)
+        dashboardReader = try StatisticsReader(databaseURL: databaseURL)
+        reader = try StatisticsReader(databaseURL: databaseURL)
     }
 
+    @available(*, deprecated, message: "The application owns the flush cadence.")
     func startPeriodicFlush() {
-        guard flushTask == nil else { return }
-        flushTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(2))
-                try? await self?.flush()
-            }
-        }
-    }
-
-    deinit {
-        flushTask?.cancel()
+        // Kept as a source-compatible no-op while callers move to an
+        // application-owned timer. Having a second timer here would recreate
+        // the refresh storm this split is intended to remove.
     }
 
     func registerDevice(referenceID: UInt64, descriptor: DeviceDescriptor) throws -> UUID {
@@ -46,30 +43,54 @@ actor StatisticsEngine {
         pending[pendingKey, default: 0] += 1
     }
 
-    func flush() throws {
-        guard !pending.isEmpty else { return }
-        let batch = pending.map {
+    func record(referenceID: UInt64, key: HIDKeyID, at date: Date = Date()) {
+        guard let deviceID = connectedReferences[referenceID] else { return }
+        record(deviceID: deviceID, key: key, at: date)
+    }
+
+    @discardableResult
+    func flush() throws -> FlushResult? {
+        guard !pending.isEmpty else { return nil }
+
+        let batch = pending.map { entry in
             CountIncrement(
-                minute: $0.key.minute,
-                hour: $0.key.hour,
-                localDay: $0.key.localDay,
-                deviceID: $0.key.deviceID,
-                key: $0.key.key,
-                count: $0.value
+                minute: entry.key.minute,
+                hour: entry.key.hour,
+                localDay: entry.key.localDay,
+                deviceID: entry.key.deviceID,
+                key: entry.key.key,
+                count: entry.value
             )
         }
-        try store.apply(batch)
+        let revision = try store.apply(batch)
         pending.removeAll(keepingCapacity: true)
+
+        let deltas = batch.map(FlushDelta.init)
+        return FlushResult(
+            revision: revision,
+            deltas: deltas,
+            invalidation: .counts(revision: revision, deltas: deltas)
+        )
     }
 
-    func performMaintenance(now: Date = Date()) throws {
+    @discardableResult
+    func performMaintenance(now: Date = Date()) throws -> FlushResult? {
+        let before = try store.revision()
         let cutoff = TimeBuckets.minute(for: now.addingTimeInterval(-30 * 24 * 60 * 60))
         try store.pruneMinuteData(before: cutoff)
+        let after = try store.revision()
+        guard after != before else { return nil }
+        return .full(revision: after)
     }
 
-    func dashboard() throws -> DashboardSnapshot {
-        try flush()
-        return try store.dashboard(connected: Set(connectedReferences.values))
+    func currentRevision() throws -> Int64 {
+        try store.revision()
+    }
+
+    // Compatibility reads delegate to the independent reader connection. They
+    // no longer hold the writer actor or block input accumulation.
+    func dashboard() async throws -> RevisionedDashboardSnapshot {
+        return try await dashboardReader.dashboard(connected: Set(connectedReferences.values))
     }
 
     func trend(
@@ -77,50 +98,71 @@ actor StatisticsEngine {
         from: Date,
         to: Date,
         deviceID: UUID?
-    ) throws -> [TrendPoint] {
-        try flush()
-        let rows = try store.trendRows(from: from, to: to, minute: granularity == .minute, deviceID: deviceID)
-        let calendar = Calendar.autoupdatingCurrent
-        var grouped: [TrendGroup: Int64] = [:]
-        var names: [UUID: String] = [:]
-        for row in rows {
-            let rawDate = Date(timeIntervalSince1970: TimeInterval(row.0))
-            let bucket = TimeBuckets.start(of: granularity, for: rawDate, calendar: calendar)
-            grouped[TrendGroup(date: bucket, deviceID: row.1), default: 0] += row.3
-            names[row.1] = row.2
-        }
-        return grouped.map {
-            TrendPoint(date: $0.key.date, deviceID: $0.key.deviceID, deviceName: names[$0.key.deviceID] ?? "未知键盘", count: $0.value)
-        }.sorted { lhs, rhs in
-            lhs.date == rhs.date ? lhs.deviceName < rhs.deviceName : lhs.date < rhs.date
-        }
-    }
-
-    func keyCounts(from: Date, to: Date, deviceID: UUID?) throws -> [KeyCount] {
-        try flush()
-        return try store.keyCounts(
-            fromDay: TimeBuckets.localDay(for: from),
-            toDay: TimeBuckets.localDay(for: to),
-            deviceID: deviceID
+    ) async throws -> [TrendPoint] {
+        _ = try flush()
+        return try await reader.trend(
+            granularity: granularity,
+            from: from,
+            to: to,
+            deviceID: deviceID,
+            calendar: .autoupdatingCurrent
         )
     }
 
-    func renameDevice(id: UUID, name: String) throws { try store.renameDevice(id: id, name: name) }
-    func setDeviceHidden(id: UUID, hidden: Bool) throws { try store.setDeviceHidden(id: id, hidden: hidden) }
-    func deleteDevice(id: UUID) throws { try store.deleteDevice(id: id) }
-    func clearAllCounts() throws { pending.removeAll(); try store.clearAllCounts() }
-
-    func clearCounts(deviceID: UUID) throws {
-        pending = pending.filter { $0.key.deviceID != deviceID }
-        try store.clearCounts(deviceID: deviceID)
+    func keyCounts(from: Date, to: Date, deviceID: UUID?) async throws -> [KeyCount] {
+        _ = try flush()
+        return try await reader.keyCounts(
+            from: from,
+            to: to,
+            deviceID: deviceID,
+            calendar: .autoupdatingCurrent
+        )
     }
 
-    func mergeDevice(source: UUID, target: UUID) throws {
-        try flush()
+    @discardableResult
+    func renameDevice(id: UUID, name: String) throws -> FlushResult {
+        _ = try flush()
+        try store.renameDevice(id: id, name: name)
+        return .full(revision: try store.revision(), deviceIDs: [id])
+    }
+
+    @discardableResult
+    func setDeviceHidden(id: UUID, hidden: Bool) throws -> FlushResult {
+        _ = try flush()
+        try store.setDeviceHidden(id: id, hidden: hidden)
+        return .full(revision: try store.revision(), deviceIDs: [id])
+    }
+
+    @discardableResult
+    func deleteDevice(id: UUID) throws -> FlushResult {
+        try store.deleteDevice(id: id)
+        pending = pending.filter { $0.key.deviceID != id }
+        connectedReferences = connectedReferences.filter { $0.value != id }
+        return .full(revision: try store.revision(), deviceIDs: [id])
+    }
+
+    @discardableResult
+    func clearAllCounts() throws -> FlushResult {
+        try store.clearAllCounts()
+        pending.removeAll(keepingCapacity: true)
+        return .full(revision: try store.revision())
+    }
+
+    @discardableResult
+    func clearCounts(deviceID: UUID) throws -> FlushResult {
+        try store.clearCounts(deviceID: deviceID)
+        pending = pending.filter { $0.key.deviceID != deviceID }
+        return .full(revision: try store.revision(), deviceIDs: [deviceID])
+    }
+
+    @discardableResult
+    func mergeDevice(source: UUID, target: UUID) throws -> FlushResult {
+        _ = try flush()
         try store.mergeDevice(source: source, target: target)
         for (reference, id) in connectedReferences where id == source {
             connectedReferences[reference] = target
         }
+        return .full(revision: try store.revision(), deviceIDs: [source, target])
     }
 }
 
@@ -132,7 +174,15 @@ private struct PendingKey: Hashable {
     let key: HIDKeyID
 }
 
-private struct TrendGroup: Hashable {
-    let date: Date
-    let deviceID: UUID
+private extension FlushDelta {
+    init(_ increment: CountIncrement) {
+        self.init(
+            minuteBucket: increment.minute,
+            hourBucket: increment.hour,
+            localDay: increment.localDay,
+            deviceID: increment.deviceID,
+            key: increment.key,
+            count: increment.count
+        )
+    }
 }

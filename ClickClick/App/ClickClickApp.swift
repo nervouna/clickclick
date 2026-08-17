@@ -17,14 +17,31 @@ struct ClickClickApp: App {
             MenuBarView()
                 .environment(model)
         } label: {
-            Label(model.dashboard.todayTotal.formatted(), systemImage: "keyboard")
+            MenuBarLabel()
+                .environment(model)
         }
         .menuBarExtraStyle(.window)
 
         Window("详细统计", id: "statistics") {
-            StatisticsView()
-                .environment(model)
-                .frame(minWidth: 840, minHeight: 620)
+            Group {
+                if let statisticsModel = model.statisticsViewModel {
+                    StatisticsView(
+                        model: statisticsModel,
+                        hideZeroCountDevices: model.hideZeroCountDevices
+                    )
+                } else if let errorMessage = model.errorMessage {
+                    ContentUnavailableView {
+                        Label("无法打开统计数据库", systemImage: "externaldrive.badge.exclamationmark")
+                    } description: {
+                        Text(errorMessage)
+                    }
+                } else {
+                    ProgressView("正在准备统计数据库…")
+                        .controlSize(.large)
+                }
+            }
+            .environment(model)
+            .frame(minWidth: 840, minHeight: 620)
         }
         .defaultSize(width: 980, height: 720)
 
@@ -35,10 +52,44 @@ struct ClickClickApp: App {
         }
     }
 }
+
+private struct MenuBarLabel: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Label(model.dashboard.todayTotal.formatted(), systemImage: "keyboard")
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
     private var isTerminating = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(clockOrWakeDidChange),
+            name: Notification.Name.NSSystemTimeZoneDidChange,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(clockOrWakeDidChange),
+            name: Notification.Name.NSCalendarDayChanged,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(clockOrWakeDidChange),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Task { await model?.applicationDidBecomeActive() }
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !isTerminating, let model else { return .terminateNow }
@@ -48,5 +99,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
+    }
+
+    @objc private func clockOrWakeDidChange() {
+        Task { await model?.clockOrWakeDidChange() }
     }
 }

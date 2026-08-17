@@ -9,6 +9,8 @@ actor CoreHIDInputMonitor {
     private var transitions: [UInt64: KeyTransitionCounter] = [:]
     private var canonicalIDs: [UInt64: UUID] = [:]
     private var mediaDeduplicator = MediaPressDeduplicator()
+    private var deviceDirectoryDidChange: (@Sendable () async -> Void)?
+    private var stateDidChange: (@Sendable (InputPermissionState) async -> Void)?
     private(set) var state: InputPermissionState = InputPermission.currentState()
     private(set) var isPaused = false
 
@@ -16,20 +18,29 @@ actor CoreHIDInputMonitor {
         self.engine = engine
     }
 
-    func refreshPermission() -> InputPermissionState {
+    func setDeviceDirectoryHandler(_ handler: (@Sendable () async -> Void)?) {
+        deviceDirectoryDidChange = handler
+    }
+
+    func setStateHandler(_ handler: (@Sendable (InputPermissionState) async -> Void)?) {
+        stateDidChange = handler
+    }
+
+    func refreshPermission() async -> InputPermissionState {
         let permission = InputPermission.currentState()
         if case .granted = permission, monitorTask == nil {
             start()
         } else if permission != .granted {
-            stopListening()
+            await stopListening(notifyDirectoryChange: true)
         }
         state = permission
+        await stateDidChange?(state)
         return state
     }
 
-    func requestPermission() -> InputPermissionState {
+    func requestPermission() async -> InputPermissionState {
         _ = InputPermission.request()
-        return refreshPermission()
+        return await refreshPermission()
     }
 
     func setPaused(_ paused: Bool) {
@@ -49,17 +60,24 @@ actor CoreHIDInputMonitor {
         }
     }
 
-    func stop() {
-        stopListening()
+    func stop() async {
+        await stopListening(notifyDirectoryChange: false)
     }
 
-    private func stopListening() {
+    private func stopListening(notifyDirectoryChange: Bool) async {
         monitorTask?.cancel()
         monitorTask = nil
         for task in deviceTasks.values { task.cancel() }
+        let referenceIDs = Array(canonicalIDs.keys)
         deviceTasks.removeAll()
         transitions.removeAll()
         canonicalIDs.removeAll()
+        for referenceID in referenceIDs {
+            await engine.disconnect(referenceID: referenceID)
+        }
+        if notifyDirectoryChange, !referenceIDs.isEmpty {
+            await deviceDirectoryDidChange?()
+        }
     }
 
     private func observeDevices() async {
@@ -92,6 +110,7 @@ actor CoreHIDInputMonitor {
             if !Task.isCancelled {
                 state = .failed(error.localizedDescription)
                 monitorTask = nil
+                await stateDidChange?(state)
             }
         }
     }
@@ -134,6 +153,7 @@ actor CoreHIDInputMonitor {
             let canonicalID = try await engine.registerDevice(referenceID: reference.deviceID, descriptor: descriptor)
             canonicalIDs[reference.deviceID] = canonicalID
             transitions[reference.deviceID] = KeyTransitionCounter()
+            await deviceDirectoryDidChange?()
             let elements = await client.elements.filter { element in
                 element.type == .input && (
                     element.usage.page == HIDUsage.KeyboardOrKeypadUsage.page ||
@@ -146,6 +166,7 @@ actor CoreHIDInputMonitor {
             }
         } catch {
             state = .failed(error.localizedDescription)
+            await stateDidChange?(state)
         }
     }
 
@@ -168,6 +189,7 @@ actor CoreHIDInputMonitor {
         } catch {
             if !Task.isCancelled {
                 state = .failed(error.localizedDescription)
+                await stateDidChange?(state)
             }
         }
     }
@@ -194,7 +216,7 @@ actor CoreHIDInputMonitor {
         if key.isConsumerKey {
             guard mediaDeduplicator.shouldCount(deviceID: deviceID, key: key) else { return }
         }
-        await engine.record(deviceID: deviceID, key: key)
+        await engine.record(referenceID: referenceID, key: key)
     }
 
     private func detach(referenceID: UInt64) async {
@@ -203,6 +225,7 @@ actor CoreHIDInputMonitor {
         transitions.removeValue(forKey: referenceID)
         canonicalIDs.removeValue(forKey: referenceID)
         await engine.disconnect(referenceID: referenceID)
+        await deviceDirectoryDidChange?()
     }
 }
 

@@ -2,7 +2,9 @@ import Charts
 import SwiftUI
 
 struct StatisticsView: View {
-    @Environment(AppModel.self) private var model
+    let model: StatisticsViewModel
+    let hideZeroCountDevices: Bool
+
     @State private var section: StatisticsSection = .overview
 
     var body: some View {
@@ -13,101 +15,216 @@ struct StatisticsView: View {
             .navigationTitle("咔咔咔咔")
             .navigationSplitViewColumnWidth(180)
         } detail: {
-            Group {
-                switch section {
-                case .overview: OverviewView()
-                case .devices: DevicesView()
-                case .privacy: PrivacyView()
-                }
-            }
-            .environment(model)
+            detail
         }
-        .task { await model.refresh() }
+        .onAppear { model.setVisible(true) }
+        .onDisappear { model.setVisible(false) }
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        switch section {
+        case .overview:
+            statisticsOverview
+        case .devices:
+            DevicesView()
+        case .privacy:
+            PrivacyView()
+        }
+    }
+
+    @ViewBuilder
+    private var statisticsOverview: some View {
+        if let snapshot = model.snapshot {
+            OverviewView(
+                data: OverviewData(
+                    snapshot: snapshot,
+                    hideZeroCountDevices: hideZeroCountDevices
+                ),
+                granularity: Binding(
+                    get: { model.granularity },
+                    set: { model.setGranularity($0) }
+                ),
+                selectedDeviceID: Binding(
+                    get: { model.selectedDeviceID },
+                    set: { model.selectDevice($0) }
+                )
+            )
+            .overlay(alignment: .topTrailing) {
+                RefreshStatusOverlay(model: model)
+                .padding(16)
+            }
+        } else {
+            InitialLoadStateView(model: model)
+        }
     }
 }
 
 private enum StatisticsSection: String, CaseIterable, Identifiable {
     case overview, devices, privacy
+
     var id: Self { self }
+
     var title: String {
-        switch self { case .overview: "统计"; case .devices: "键盘设备"; case .privacy: "隐私" }
+        switch self {
+        case .overview: "统计"
+        case .devices: "键盘设备"
+        case .privacy: "隐私"
+        }
     }
+
     var icon: String {
-        switch self { case .overview: "chart.xyaxis.line"; case .devices: "keyboard"; case .privacy: "hand.raised" }
+        switch self {
+        case .overview: "chart.xyaxis.line"
+        case .devices: "keyboard"
+        case .privacy: "hand.raised"
+        }
+    }
+}
+
+private struct OverviewData {
+    let rangeStart: Date
+    let rangeEnd: Date
+    let devices: [KeyboardDevice]
+    let trend: [TrendPoint]
+    let total: Int64
+    let average: Int64
+    let peak: Int64
+    let activeDeviceCount: Int
+    let keyboardRanking: [KeyCount]
+    let consumerRanking: [KeyCount]
+    let heatmapCounts: [HIDKeyID: Int64]
+    let heatmapMaximum: Double
+    let heatmapMediaCounts: [KeyCount]
+
+    init(snapshot: StatisticsSnapshot, hideZeroCountDevices: Bool) {
+        rangeStart = snapshot.rangeStart
+        rangeEnd = snapshot.rangeEnd
+        devices = hideZeroCountDevices
+            ? snapshot.devices.filter { $0.totalCount > 0 }
+            : snapshot.devices
+        trend = snapshot.trend
+        total = snapshot.summary.total
+        average = snapshot.summary.average
+        peak = snapshot.summary.peak
+        activeDeviceCount = snapshot.summary.activeDeviceCount
+        keyboardRanking = snapshot.keyboardRanking
+        consumerRanking = snapshot.consumerRanking
+        heatmapCounts = snapshot.heatmapCounts
+        heatmapMaximum = snapshot.heatmapMaximum
+        heatmapMediaCounts = snapshot.heatmapMediaCounts
     }
 }
 
 private struct OverviewView: View {
-    @Environment(AppModel.self) private var model
+    let data: OverviewData
+    @Binding var granularity: TrendGranularity
+    @Binding var selectedDeviceID: UUID?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("输入趋势").font(.largeTitle.bold())
-                        Text(rangeDescription).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    devicePicker
-                    Picker("粒度", selection: Bindable(model).granularity) {
-                        ForEach(TrendGranularity.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 330)
-                    .onChange(of: model.granularity) { _, value in Task { await model.setGranularity(value) } }
-                }
-
-                summaryCards
-                trendChart
-
+                OverviewHeader(
+                    rangeStart: data.rangeStart,
+                    rangeEnd: data.rangeEnd,
+                    devices: data.devices,
+                    granularity: $granularity,
+                    selectedDeviceID: $selectedDeviceID
+                )
+                SummaryCards(
+                    total: data.total,
+                    average: data.average,
+                    peak: data.peak,
+                    activeDeviceCount: data.activeDeviceCount
+                )
+                TrendChartView(
+                    points: data.trend,
+                    showsDeviceBreakdown: selectedDeviceID == nil
+                )
                 HStack(alignment: .top, spacing: 18) {
-                    VStack(spacing: 18) {
-                        keyRanking(title: "常用按键", items: model.keyCounts.filter { !$0.key.isConsumerKey })
-                        keyRanking(title: "媒体键", items: model.keyCounts.filter { $0.key.isConsumerKey })
-                    }
-                        .frame(minWidth: 260, maxWidth: 330)
-                    KeyboardHeatmap(counts: model.keyCounts)
-                        .frame(maxWidth: .infinity)
+                    KeyRankingsView(
+                        keyboardItems: data.keyboardRanking,
+                        consumerItems: data.consumerRanking
+                    )
+                    .frame(minWidth: 260, maxWidth: 330)
+
+                    KeyboardHeatmap(
+                        countMap: data.heatmapCounts,
+                        maximum: data.heatmapMaximum,
+                        mediaCounts: data.heatmapMediaCounts
+                    )
+                    .frame(maxWidth: .infinity)
                 }
             }
             .padding(24)
         }
         .navigationTitle("详细统计")
     }
+}
 
-    private var devicePicker: some View {
-        Picker("设备", selection: Bindable(model).selectedDeviceID) {
-            Text("全部键盘").tag(UUID?.none)
-            ForEach(model.visibleDevices) { device in
-                Text(device.name).tag(Optional(device.id))
+private struct OverviewHeader: View {
+    let rangeStart: Date
+    let rangeEnd: Date
+    let devices: [KeyboardDevice]
+    @Binding var granularity: TrendGranularity
+    @Binding var selectedDeviceID: UUID?
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("输入趋势").font(.largeTitle.bold())
+                Text(rangeDescription).foregroundStyle(.secondary)
             }
+            Spacer()
+            Picker("设备", selection: $selectedDeviceID) {
+                Text("全部键盘").tag(UUID?.none)
+                ForEach(devices) { device in
+                    Text(device.name).tag(Optional(device.id))
+                }
+            }
+            .frame(width: 190)
+            Picker("粒度", selection: $granularity) {
+                ForEach(TrendGranularity.allCases) { granularity in
+                    Text(granularity.rawValue).tag(granularity)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 330)
         }
-        .frame(width: 190)
-        .onChange(of: model.selectedDeviceID) { _, value in Task { await model.selectDevice(value) } }
     }
 
-    private var summaryCards: some View {
-        let total = model.trend.reduce(Int64(0)) { $0 + $1.count }
-        let grouped = Dictionary(grouping: model.trend, by: \.date).mapValues { $0.reduce(Int64(0)) { $0 + $1.count } }
-        let peak = grouped.values.max() ?? 0
-        let average = grouped.isEmpty ? 0 : total / Int64(grouped.count)
-        return HStack(spacing: 12) {
+    private var rangeDescription: String {
+        "\(rangeStart.formatted(date: .abbreviated, time: .shortened)) – \(rangeEnd.formatted(date: .abbreviated, time: .shortened))"
+    }
+}
+
+private struct SummaryCards: View {
+    let total: Int64
+    let average: Int64
+    let peak: Int64
+    let activeDeviceCount: Int
+
+    var body: some View {
+        HStack(spacing: 12) {
             MetricCard(title: "总按键数", value: total.formatted(), icon: "keyboard")
             MetricCard(title: "平均每个时间桶", value: average.formatted(), icon: "chart.bar")
             MetricCard(title: "峰值", value: peak.formatted(), icon: "bolt.fill")
-            MetricCard(title: "活跃键盘", value: Set(model.trend.map(\.deviceID)).count.formatted(), icon: "externaldrive.connected.to.line.below")
+            MetricCard(title: "活跃键盘", value: activeDeviceCount.formatted(), icon: "externaldrive.connected.to.line.below")
         }
     }
+}
 
-    @ViewBuilder
-    private var trendChart: some View {
+private struct TrendChartView: View {
+    let points: [TrendPoint]
+    let showsDeviceBreakdown: Bool
+
+    var body: some View {
         GroupBox {
-            if model.trend.isEmpty {
+            if points.isEmpty {
                 ContentUnavailableView("这个时间范围还没有数据", systemImage: "chart.xyaxis.line")
                     .frame(height: 260)
-            } else if model.selectedDeviceID == nil {
-                Chart(model.trend) { point in
+            } else if showsDeviceBreakdown {
+                Chart(points, id: \.id) { point in
                     AreaMark(
                         x: .value("时间", point.date),
                         y: .value("按键", point.count)
@@ -118,32 +235,57 @@ private struct OverviewView: View {
                 .chartLegend(position: .bottom, alignment: .leading)
                 .frame(height: 280)
             } else {
-                Chart(model.trend) { point in
+                Chart(points, id: \.id) { point in
                     LineMark(
                         x: .value("时间", point.date),
                         y: .value("按键", point.count)
                     )
                     .interpolationMethod(.monotone)
-                    PointMark(x: .value("时间", point.date), y: .value("按键", point.count))
+                    PointMark(
+                        x: .value("时间", point.date),
+                        y: .value("按键", point.count)
+                    )
                 }
                 .frame(height: 280)
             }
         }
     }
+}
 
-    private func keyRanking(title: String, items: [KeyCount]) -> some View {
+private struct KeyRankingsView: View {
+    let keyboardItems: [KeyCount]
+    let consumerItems: [KeyCount]
+
+    var body: some View {
+        VStack(spacing: 18) {
+            KeyRankingCard(title: "常用按键", items: keyboardItems, emptyHeight: 220)
+            KeyRankingCard(title: "媒体键", items: consumerItems, emptyHeight: 100)
+        }
+    }
+}
+
+private struct KeyRankingCard: View {
+    let title: String
+    let items: [KeyCount]
+    let emptyHeight: CGFloat
+
+    var body: some View {
         GroupBox(title) {
             if items.isEmpty {
                 ContentUnavailableView("暂无数据", systemImage: "list.number")
-                    .frame(height: title == "媒体键" ? 100 : 220)
+                    .frame(height: emptyHeight)
             } else {
                 VStack(spacing: 10) {
                     ForEach(Array(items.prefix(12).enumerated()), id: \.element.id) { index, item in
                         HStack {
-                            Text("\(index + 1)").foregroundStyle(.tertiary).frame(width: 20, alignment: .trailing)
+                            Text("\(index + 1)")
+                                .foregroundStyle(.tertiary)
+                                .frame(width: 20, alignment: .trailing)
                             Text(KeyCatalog.name(for: item.key)).lineLimit(1)
                             Spacer()
-                            Text(item.count.formatted()).monospacedDigit().foregroundStyle(.secondary)
+                            Text(item.count.formatted())
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -151,9 +293,63 @@ private struct OverviewView: View {
             }
         }
     }
+}
 
-    private var rangeDescription: String {
-        "\(model.rangeStart.formatted(date: .abbreviated, time: .shortened)) – \(model.rangeEnd.formatted(date: .abbreviated, time: .shortened))"
+private struct RefreshStatusOverlay: View {
+    let model: StatisticsViewModel
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            if model.isLoading {
+                Label {
+                    Text("正在更新")
+                } icon: {
+                    ProgressView().controlSize(.small)
+                }
+                .font(.caption)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(.regularMaterial, in: Capsule())
+                .allowsHitTesting(false)
+            }
+            if let errorMessage = model.errorMessage, !model.isLoading {
+                HStack(spacing: 8) {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle")
+                        .lineLimit(2)
+                    Button("重试") { model.retry() }
+                }
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .padding(10)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .frame(maxWidth: 360)
+            }
+        }
+    }
+}
+
+private struct InitialLoadStateView: View {
+    let model: StatisticsViewModel
+
+    @ViewBuilder
+    var body: some View {
+        if let errorMessage = model.errorMessage, !model.isLoading {
+            ContentUnavailableView {
+                Label("无法载入统计", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(errorMessage)
+            } actions: {
+                Button("重试") { model.retry() }
+                    .buttonStyle(.borderedProminent)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .navigationTitle("详细统计")
+        } else {
+            ProgressView("正在载入统计…")
+                .controlSize(.large)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .navigationTitle("详细统计")
+        }
     }
 }
 

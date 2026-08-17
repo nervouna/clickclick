@@ -64,7 +64,10 @@ struct MenuBarView: View {
         }
         .padding(16)
         .frame(width: 390)
-        .sheet(isPresented: Bindable(model).showingOnboarding) {
+        .sheet(isPresented: Binding(
+            get: { model.showingOnboarding },
+            set: { model.showingOnboarding = $0 }
+        )) {
             OnboardingView()
                 .environment(model)
         }
@@ -118,7 +121,7 @@ struct PermissionCard: View {
                         .buttonStyle(.borderedProminent)
                 } else {
                     Button("打开系统设置") { model.openPermissionSettings() }
-                    Button("重新检查") { Task { await model.refresh() } }
+                    Button("重新检查") { Task { await model.recheckPermission() } }
                 }
             }
         }
