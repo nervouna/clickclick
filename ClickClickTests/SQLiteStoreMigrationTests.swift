@@ -230,6 +230,159 @@ struct SQLiteStoreMigrationTests {
         }
     }
 
+    @Test func destructivePrivacyMutationsRemoveV1BackupIncludingDatabaseNoOps() throws {
+        for mutation in BackupRemovingMutation.allCases {
+            let fixture = try LegacyStoreFixture()
+            try fixture.createCanonicalV1()
+            let store = try SQLiteStore(url: fixture.databaseURL)
+            #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
+
+            try mutation.perform(on: store, fixture: fixture, noOp: false)
+
+            #expect(
+                !FileManager.default.fileExists(atPath: fixture.backupURL.path),
+                "\(mutation) retained the recoverable v1 backup"
+            )
+        }
+
+        for mutation in BackupRemovingMutation.allCases {
+            let fixture = try LegacyStoreFixture()
+            try fixture.createCanonicalV1()
+            let store = try SQLiteStore(url: fixture.databaseURL)
+            try mutation.prepareNoOp(fixture: fixture)
+            #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
+
+            try mutation.perform(on: store, fixture: fixture, noOp: true)
+
+            #expect(
+                !FileManager.default.fileExists(atPath: fixture.backupURL.path),
+                "\(mutation) no-op retained the recoverable v1 backup"
+            )
+        }
+    }
+
+    @Test func backupRemovalFailurePreventsEveryActiveDatabaseMutation() throws {
+        let countQueries = [
+            "SELECT COALESCE(SUM(count), 0) FROM minute_device_counts",
+            "SELECT COALESCE(SUM(count), 0) FROM hourly_device_counts",
+            "SELECT COALESCE(SUM(count), 0) FROM daily_device_key_counts",
+            "SELECT COALESCE(SUM(count), 0) FROM daily_device_counts",
+            "SELECT COALESCE(SUM(count), 0) FROM monthly_device_key_counts",
+            "SELECT COALESCE(SUM(count), 0) FROM device_total_counts"
+        ]
+        for mutation in BackupRemovingMutation.allCases {
+            let fixture = try LegacyStoreFixture()
+            try fixture.createCanonicalV1()
+            let store = try SQLiteStore(
+                url: fixture.databaseURL,
+                backupRemover: { _ in throw InjectedBackupRemovalError() }
+            )
+            let countsBefore = try countQueries.map { try fixture.int($0) }
+            let devicesBefore = try fixture.int("SELECT COUNT(*) FROM devices")
+            let revisionBefore = try store.revision()
+
+            #expect(throws: (any Error).self) {
+                try mutation.perform(on: store, fixture: fixture, noOp: false)
+            }
+
+            #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
+            #expect(try countQueries.map { try fixture.int($0) } == countsBefore)
+            #expect(try fixture.int("SELECT COUNT(*) FROM devices") == devicesBefore)
+            #expect(try store.revision() == revisionBefore)
+        }
+    }
+
+    @Test func fileNotFoundRemovalResultIsVerifiedAgainstTheBackupPath() throws {
+        let fixture = try LegacyStoreFixture()
+        try fixture.createCanonicalV1()
+        let store = try SQLiteStore(
+            url: fixture.databaseURL,
+            backupRemover: { _ in throw CocoaError(.fileNoSuchFile) }
+        )
+        let revisionBefore = try store.revision()
+
+        #expect(throws: (any Error).self) {
+            _ = try store.clearCounts(deviceID: fixture.visibleID)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
+        #expect(try fixture.int("SELECT SUM(count) FROM daily_device_key_counts") == 56)
+        #expect(try store.revision() == revisionBefore)
+    }
+
+    @Test func failedMutationRollsBackCanonicalReconciliationAndRetainsBackup() throws {
+        let fixture = try LegacyStoreFixture()
+        try fixture.createCanonicalV1()
+        try fixture.addAlignedLegacyTimeSeries()
+        let store = try SQLiteStore(url: fixture.databaseURL)
+        let revisionBeforeLegacyWrite = try store.revision()
+        try fixture.execute("""
+            UPDATE daily_device_key_counts SET count = count + 4
+            WHERE device_id = '\(fixture.hiddenID.uuidString)'
+              AND local_day = '2026-01-15' AND usage = 4;
+            CREATE TRIGGER fail_reconciled_clear
+            BEFORE DELETE ON minute_device_counts
+            BEGIN SELECT RAISE(ABORT, 'injected post-reconciliation failure'); END;
+            """)
+
+        #expect(throws: (any Error).self) {
+            _ = try store.clearCounts(deviceID: fixture.visibleID)
+        }
+
+        #expect(try store.revision() == revisionBeforeLegacyWrite)
+        #expect(try fixture.int("SELECT canonical_signature = 'dirty' FROM statistics_state") == 1)
+        #expect(try fixture.int("SELECT SUM(count) FROM daily_device_key_counts") == 60)
+        #expect(try fixture.int("SELECT SUM(count) FROM daily_device_counts") == 56)
+        #expect(try fixture.int("SELECT SUM(count) FROM monthly_device_key_counts") == 56)
+        #expect(try fixture.int("SELECT SUM(count) FROM device_total_counts") == 56)
+        #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
+    }
+
+    @Test func destructiveMutationsReconcileDirtyCanonicalDataBeforePublishing() throws {
+        for mutation in DirtyCanonicalMutation.allCases {
+            let fixture = try LegacyStoreFixture()
+            try fixture.createCanonicalV1()
+            var publishedRevision: Int64 = 0
+
+            do {
+                let store = try SQLiteStore(url: fixture.databaseURL)
+                let revisionBeforeLegacyWrite = try store.revision()
+                try fixture.execute(
+                    "UPDATE daily_device_key_counts SET count = count + 4 "
+                        + "WHERE device_id = '\(mutation.dirtyDeviceID(fixture: fixture).uuidString)' "
+                        + "AND local_day = '2026-01-15' AND usage = 4;"
+                )
+
+                publishedRevision = try mutation.perform(on: store, fixture: fixture)
+
+                #expect(
+                    publishedRevision == revisionBeforeLegacyWrite + 1,
+                    "\(mutation) did not publish exactly one reconciled revision"
+                )
+                try mutation.expectReadModels(on: store, fixture: fixture)
+            }
+
+            let reopened = try SQLiteStore(url: fixture.databaseURL)
+            #expect(
+                try reopened.revision() == publishedRevision,
+                "\(mutation) left drift that required another startup rebuild"
+            )
+            try mutation.expectReadModels(on: reopened, fixture: fixture)
+        }
+    }
+
+    @Test func cleanMutationNoOpsDoNotAdvanceRevision() throws {
+        let fixture = try LegacyStoreFixture()
+        try fixture.createCanonicalV1()
+        let store = try SQLiteStore(url: fixture.databaseURL)
+        let baseline = try store.revision()
+
+        #expect(try store.mergeDevice(source: fixture.visibleID, target: fixture.visibleID) == baseline)
+        #expect(try store.clearCounts(deviceID: UUID()) == baseline)
+        #expect(try store.deleteDevice(id: UUID()) == baseline)
+        #expect(try store.revision() == baseline)
+    }
+
     @Test func migrationFailureRollsBackSchemaAndCanonicalRows() throws {
         let fixture = try LegacyStoreFixture()
         try fixture.createCanonicalV1()
@@ -494,4 +647,97 @@ private final class LegacyStoreFixture {
 
 private enum LegacyFixtureError: Error {
     case sqlite(String)
+}
+
+private struct InjectedBackupRemovalError: Error {}
+
+private enum BackupRemovingMutation: String, CaseIterable {
+    case clearAll
+    case clearDevice
+    case deleteDevice
+
+    func prepareNoOp(fixture: LegacyStoreFixture) throws {
+        guard self == .clearAll else { return }
+        try fixture.execute("""
+            DELETE FROM minute_device_counts;
+            DELETE FROM hourly_device_counts;
+            DELETE FROM daily_device_key_counts;
+            DELETE FROM daily_device_counts;
+            DELETE FROM monthly_device_key_counts;
+            DELETE FROM device_total_counts;
+            UPDATE statistics_state SET canonical_signature = 'v1:0';
+            """)
+    }
+
+    func perform(on store: SQLiteStore, fixture: LegacyStoreFixture, noOp: Bool) throws {
+        switch self {
+        case .clearAll:
+            _ = try store.clearAllCounts()
+        case .clearDevice:
+            _ = try store.clearCounts(deviceID: noOp ? UUID() : fixture.visibleID)
+        case .deleteDevice:
+            _ = try store.deleteDevice(id: noOp ? UUID() : fixture.visibleID)
+        }
+    }
+}
+
+private enum DirtyCanonicalMutation: String, CaseIterable {
+    case merge
+    case mergeSame
+    case delete
+    case clearDevice
+    case clearMissing
+    case deleteMissing
+    case clearAll
+
+    func dirtyDeviceID(fixture: LegacyStoreFixture) -> UUID {
+        self == .clearDevice ? fixture.hiddenID : fixture.visibleID
+    }
+
+    func perform(on store: SQLiteStore, fixture: LegacyStoreFixture) throws -> Int64 {
+        switch self {
+        case .merge:
+            return try store.mergeDevice(source: fixture.hiddenID, target: fixture.visibleID)
+        case .mergeSame:
+            return try store.mergeDevice(source: fixture.visibleID, target: fixture.visibleID)
+        case .delete:
+            return try store.deleteDevice(id: fixture.hiddenID)
+        case .clearDevice:
+            return try store.clearCounts(deviceID: fixture.visibleID)
+        case .clearMissing:
+            return try store.clearCounts(deviceID: UUID())
+        case .deleteMissing:
+            return try store.deleteDevice(id: UUID())
+        case .clearAll:
+            return try store.clearAllCounts()
+        }
+    }
+
+    func expectReadModels(on store: SQLiteStore, fixture: LegacyStoreFixture) throws {
+        let expectedTotal: Int64
+        switch self {
+        case .merge:
+            expectedTotal = 60
+            #expect(try store.fetchDevices(connected: []).count == 1)
+            #expect(try store.fetchDevices(connected: [])[0].id == fixture.visibleID)
+        case .mergeSame, .clearMissing, .deleteMissing:
+            expectedTotal = 60
+            #expect(try store.fetchDevices(connected: []).count == 2)
+        case .delete:
+            expectedTotal = 43
+            #expect(try store.fetchDevices(connected: []).count == 1)
+            #expect(try store.fetchDevices(connected: [])[0].id == fixture.visibleID)
+        case .clearDevice:
+            expectedTotal = 21
+            #expect(
+                try store.fetchDevices(connected: []).first(where: { $0.id == fixture.visibleID })?.totalCount == 0
+            )
+        case .clearAll:
+            expectedTotal = 0
+        }
+        #expect(try fixture.int("SELECT COALESCE(SUM(count), 0) FROM daily_device_key_counts") == expectedTotal)
+        #expect(try fixture.int("SELECT COALESCE(SUM(count), 0) FROM daily_device_counts") == expectedTotal)
+        #expect(try fixture.int("SELECT COALESCE(SUM(count), 0) FROM monthly_device_key_counts") == expectedTotal)
+        #expect(try fixture.int("SELECT COALESCE(SUM(count), 0) FROM device_total_counts") == expectedTotal)
+    }
 }

@@ -62,14 +62,16 @@ actor StatisticsEngine {
                 count: entry.value
             )
         }
-        let revision = try store.apply(batch)
+        let outcome = try store.applyWithOutcome(batch)
         pending.removeAll(keepingCapacity: true)
 
         let deltas = batch.map(FlushDelta.init)
         return FlushResult(
-            revision: revision,
+            revision: outcome.revision,
             deltas: deltas,
-            invalidation: .counts(revision: revision, deltas: deltas)
+            invalidation: outcome.reconciledCanonicalState
+                ? .full(revision: outcome.revision)
+                : .counts(revision: outcome.revision, deltas: deltas)
         )
     }
 

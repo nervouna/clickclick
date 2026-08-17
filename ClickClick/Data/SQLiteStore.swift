@@ -24,6 +24,11 @@ struct CountIncrement: Hashable, Sendable {
     var count: Int64
 }
 
+struct CountApplyOutcome: Equatable, Sendable {
+    let revision: Int64
+    let reconciledCanonicalState: Bool
+}
+
 struct DailyTrendRow: Equatable, Sendable {
     let localDay: String
     let deviceID: UUID
@@ -40,13 +45,18 @@ final class SQLiteStore: @unchecked Sendable {
     private var database: OpaquePointer?
     private let databaseURL: URL
     private let isReadOnly: Bool
+    private let backupRemover: (@Sendable (URL) throws -> Void)?
     private let transientDestructor = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     private let progressLock = NSLock()
     private var progressCancellation: (() -> Bool)?
 
-    init(url: URL) throws {
+    init(
+        url: URL,
+        backupRemover: (@Sendable (URL) throws -> Void)? = nil
+    ) throws {
         databaseURL = url
         isReadOnly = false
+        self.backupRemover = backupRemover
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -68,6 +78,7 @@ final class SQLiteStore: @unchecked Sendable {
     init(readOnlyURL url: URL) throws {
         databaseURL = url
         isReadOnly = true
+        backupRemover = nil
         try open(flags: SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX)
         do {
             try run("PRAGMA foreign_keys = ON;")
@@ -194,8 +205,17 @@ final class SQLiteStore: @unchecked Sendable {
     /// revision in one transaction.
     @discardableResult
     func apply(_ increments: [CountIncrement]) throws -> Int64 {
+        try applyWithOutcome(increments).revision
+    }
+
+    func applyWithOutcome(_ increments: [CountIncrement]) throws -> CountApplyOutcome {
         let valid = increments.filter { $0.key.isCountable && $0.count > 0 }
-        guard !valid.isEmpty else { return try revision() }
+        guard !valid.isEmpty else {
+            return CountApplyOutcome(
+                revision: try revision(),
+                reconciledCanonicalState: false
+            )
+        }
 
         var minuteCounts: [V2BucketDevice: Int64] = [:]
         var hourCounts: [V2BucketDevice: Int64] = [:]
@@ -220,7 +240,7 @@ final class SQLiteStore: @unchecked Sendable {
 
         let totalDelta = valid.reduce(Int64(0)) { $0 + $1.count }
         return try writeTransaction {
-            let canonicalTotalBeforeApply = try prepareCanonicalStateForWrite()
+            let canonicalState = try prepareCanonicalStateForWrite()
             try batch(
                 """
                 INSERT INTO minute_device_counts (bucket_start, device_id, count) VALUES (?, ?, ?)
@@ -275,8 +295,11 @@ final class SQLiteStore: @unchecked Sendable {
                 """,
                 rows: totals.map { [.text($0.key.uuidString), .int($0.value)] }
             )
-            try setCanonicalSignature(total: canonicalTotalBeforeApply + totalDelta)
-            return try bumpRevision()
+            try setCanonicalSignature(total: canonicalState.total + totalDelta)
+            return CountApplyOutcome(
+                revision: try bumpRevision(),
+                reconciledCanonicalState: canonicalState.reconciled
+            )
         }
     }
 
@@ -456,8 +479,11 @@ final class SQLiteStore: @unchecked Sendable {
 
     @discardableResult
     func mergeDevice(source: UUID, target: UUID) throws -> Int64 {
-        guard source != target else { return try revision() }
         return try writeTransaction {
+            let canonicalState = try prepareCanonicalStateForWrite()
+            guard source != target else {
+                return canonicalState.reconciled ? try bumpRevision() : try revision()
+            }
             for table in ["minute_device_counts", "hourly_device_counts"] {
                 try prepared(
                     """
@@ -516,43 +542,68 @@ final class SQLiteStore: @unchecked Sendable {
 
     @discardableResult
     func deleteDevice(id: UUID) throws -> Int64 {
-        try writeTransaction {
+        return try writeTransaction {
+            let canonicalState = try prepareCanonicalStateForWrite()
             let exists = try intValue(
                 "SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)",
                 bindings: [.text(id.uuidString)]
             ) == 1
-            guard exists else { return try revision() }
-            try deleteDeviceRows(id: id)
-            try prepared("DELETE FROM devices WHERE id = ?", bindings: [.text(id.uuidString)])
-            try refreshCanonicalSignature()
-            return try bumpRevision()
+            let publishedRevision: Int64
+            if exists {
+                try deleteDeviceRows(id: id)
+                try prepared("DELETE FROM devices WHERE id = ?", bindings: [.text(id.uuidString)])
+                try refreshCanonicalSignature()
+                publishedRevision = try bumpRevision()
+            } else {
+                publishedRevision = canonicalState.reconciled ? try bumpRevision() : try revision()
+            }
+            try removeV1BackupBeforeCommit()
+            return publishedRevision
         }
     }
 
     @discardableResult
     func clearAllCounts() throws -> Int64 {
-        try writeTransaction {
+        return try writeTransaction {
             let hasCounts = try hasAnyCounts(deviceID: nil)
-            guard hasCounts else { return try revision() }
-            for table in Self.countTables { try run("DELETE FROM \(table);") }
-            try setCanonicalSignature(total: 0)
-            return try bumpRevision()
+            let storedSignature = try textValue(
+                "SELECT canonical_signature FROM statistics_state WHERE singleton = 1",
+                bindings: []
+            ) ?? ""
+            let stateChanged = hasCounts || storedSignature != "v1:0"
+            let publishedRevision: Int64
+            if stateChanged {
+                for table in Self.countTables { try run("DELETE FROM \(table);") }
+                try setCanonicalSignature(total: 0)
+                publishedRevision = try bumpRevision()
+            } else {
+                publishedRevision = try revision()
+            }
+            try removeV1BackupBeforeCommit()
+            return publishedRevision
         }
     }
 
     @discardableResult
     func clearCounts(deviceID: UUID) throws -> Int64 {
-        try writeTransaction {
+        return try writeTransaction {
+            let canonicalState = try prepareCanonicalStateForWrite()
             let hasCounts = try hasAnyCounts(deviceID: deviceID)
-            guard hasCounts else { return try revision() }
-            for table in Self.countTables {
-                try prepared(
-                    "DELETE FROM \(table) WHERE device_id = ?",
-                    bindings: [.text(deviceID.uuidString)]
-                )
+            let publishedRevision: Int64
+            if hasCounts {
+                for table in Self.countTables {
+                    try prepared(
+                        "DELETE FROM \(table) WHERE device_id = ?",
+                        bindings: [.text(deviceID.uuidString)]
+                    )
+                }
+                try refreshCanonicalSignature()
+                publishedRevision = try bumpRevision()
+            } else {
+                publishedRevision = canonicalState.reconciled ? try bumpRevision() : try revision()
             }
-            try refreshCanonicalSignature()
-            return try bumpRevision()
+            try removeV1BackupBeforeCommit()
+            return publishedRevision
         }
     }
 
@@ -847,6 +898,25 @@ final class SQLiteStore: @unchecked Sendable {
         }
     }
 
+    private func removeV1BackupBeforeCommit() throws {
+        let backupURL = databaseURL.deletingLastPathComponent().appending(path: Self.backupName)
+        do {
+            if let backupRemover {
+                try backupRemover(backupURL)
+            } else {
+                try FileManager.default.removeItem(at: backupURL)
+            }
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            // A missing file is already the desired state, but still verify
+            // the fixed recovery path in case another process raced the call.
+        } catch {
+            throw StoreError.execute("无法移除包含历史计数的 v1 备份：\(error.localizedDescription)")
+        }
+        guard !FileManager.default.fileExists(atPath: backupURL.path) else {
+            throw StoreError.execute("无法确认包含历史计数的 v1 备份已移除")
+        }
+    }
+
     private func isValidV1Backup(at url: URL) throws -> Bool {
         var backupDatabase: OpaquePointer?
         guard sqlite3_open_v2(
@@ -962,13 +1032,13 @@ final class SQLiteStore: @unchecked Sendable {
         return "v1:\(total)"
     }
 
-    private func prepareCanonicalStateForWrite() throws -> Int64 {
+    private func prepareCanonicalStateForWrite() throws -> (total: Int64, reconciled: Bool) {
         let stored = try textValue(
             "SELECT canonical_signature FROM statistics_state WHERE singleton = 1",
             bindings: []
         ) ?? "v1:0"
         if stored.hasPrefix("v1:"), let total = Int64(stored.dropFirst(3)) {
-            return total
+            return (total, false)
         }
 
         // A v1 executable can still write the canonical table because the
@@ -982,7 +1052,7 @@ final class SQLiteStore: @unchecked Sendable {
             "UPDATE statistics_state SET canonical_signature = ? WHERE singleton = 1",
             bindings: [.text(signature)]
         )
-        return Int64(signature.dropFirst(3)) ?? 0
+        return (Int64(signature.dropFirst(3)) ?? 0, true)
     }
 
     private func refreshCanonicalSignature() throws {

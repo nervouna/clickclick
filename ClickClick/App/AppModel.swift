@@ -289,8 +289,12 @@ final class AppModel {
 
     @discardableResult
     private func applyToDashboard(_ result: FlushResult) -> Set<UUID> {
-        guard !result.deltas.isEmpty else { return [] }
         guard result.revision > dashboardRevision else { return [] }
+        guard result.invalidation.scope == .counts else {
+            Task { [weak self] in await self?.refreshDashboard() }
+            return []
+        }
+        guard !result.deltas.isEmpty else { return [] }
         guard result.revision == dashboardRevision + 1 else {
             Task { [weak self] in await self?.refreshDashboard() }
             return []

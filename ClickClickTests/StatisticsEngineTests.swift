@@ -103,6 +103,36 @@ struct StatisticsEngineTests {
         #expect(snapshot.todayTotal == 0)
     }
 
+    @Test func flushPublishesFullInvalidationAfterReconcilingLegacyWriterDrift() async throws {
+        let fixture = try Fixture()
+        let engine = try StatisticsEngine(databaseURL: fixture.databaseURL)
+        let device = try await engine.registerDevice(
+            referenceID: 1,
+            descriptor: fixture.descriptor(fingerprint: "dirty-flush", name: "Dirty Flush")
+        )
+        let key = HIDKeyID(usagePage: 0x07, usage: 0x04)
+        let date = Date()
+        await engine.record(deviceID: device, key: key, at: date)
+        let firstFlush = try #require(try await engine.flush())
+        try fixture.executeSQL(
+            "UPDATE daily_device_key_counts SET count = count + 4 "
+                + "WHERE device_id = '\(device.uuidString)' AND local_day = '\(TimeBuckets.localDay(for: date))';"
+        )
+        await engine.record(deviceID: device, key: key, at: date)
+
+        let reconciledFlush = try #require(try await engine.flush())
+
+        #expect(reconciledFlush.revision == firstFlush.revision + 1)
+        #expect(reconciledFlush.deltas.reduce(Int64.zero) { $0 + $1.count } == 1)
+        #expect(reconciledFlush.invalidation.scope == .full)
+        #expect((try await engine.dashboard()).snapshot.todayTotal == 6)
+
+        await engine.record(deviceID: device, key: key, at: date)
+        let cleanFlush = try #require(try await engine.flush())
+        #expect(cleanFlush.revision == reconciledFlush.revision + 1)
+        #expect(cleanFlush.invalidation.scope == .counts)
+    }
+
     @Test func failedDestructiveMutationsRetainPendingCountsForTheNextFlush() async throws {
         for mutation in FailingDestructiveMutation.allCases {
             let fixture = try Fixture()
