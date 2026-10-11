@@ -132,42 +132,30 @@ final class SQLiteStore: @unchecked Sendable {
                 "INSERT INTO device_aliases (fingerprint, device_id) VALUES (?, ?)",
                 bindings: [.text(descriptor.observedFingerprint), .text(id.uuidString)]
             )
-            _ = try bumpRevision()
         }
         return id
     }
 
-    @discardableResult
-    func renameDevice(id: UUID, name: String) throws -> Int64 {
-        try writeTransaction {
-            let changed = try prepared(
-                "UPDATE devices SET display_name = ? WHERE id = ? AND display_name <> ?",
-                bindings: [.text(name), .text(id.uuidString), .text(name)]
-            )
-            return changed > 0 ? try bumpRevision() : try revision()
-        }
+    func renameDevice(id: UUID, name: String) throws {
+        try prepared(
+            "UPDATE devices SET display_name = ? WHERE id = ?",
+            bindings: [.text(name), .text(id.uuidString)]
+        )
     }
 
-    @discardableResult
-    func setDeviceHidden(id: UUID, hidden: Bool) throws -> Int64 {
-        try writeTransaction {
-            let value: Int64 = hidden ? 1 : 0
-            let changed = try prepared(
-                "UPDATE devices SET is_hidden = ? WHERE id = ? AND is_hidden <> ?",
-                bindings: [.int(value), .text(id.uuidString), .int(value)]
-            )
-            return changed > 0 ? try bumpRevision() : try revision()
-        }
+    func setDeviceHidden(id: UUID, hidden: Bool) throws {
+        try prepared(
+            "UPDATE devices SET is_hidden = ? WHERE id = ?",
+            bindings: [.int(hidden ? 1 : 0), .text(id.uuidString)]
+        )
     }
 
     // MARK: Incremental writes
 
-    /// Batches each aggregate key once and updates all read models plus the
-    /// revision in one transaction.
-    @discardableResult
-    func apply(_ increments: [CountIncrement]) throws -> Int64 {
+    /// Batches each aggregate key once and updates all read models in one transaction.
+    func apply(_ increments: [CountIncrement]) throws {
         let valid = increments.filter { $0.key.isCountable && $0.count > 0 }
-        guard !valid.isEmpty else { return try revision() }
+        guard !valid.isEmpty else { return }
 
         var minuteCounts: [BucketDevice: Int64] = [:]
         var hourCounts: [BucketDevice: Int64] = [:]
@@ -190,7 +178,7 @@ final class SQLiteStore: @unchecked Sendable {
             totals[increment.deviceID, default: 0] += increment.count
         }
 
-        return try writeTransaction {
+        try writeTransaction {
             try batch(
                 """
                 INSERT INTO minute_device_counts (bucket_start, device_id, count) VALUES (?, ?, ?)
@@ -245,26 +233,17 @@ final class SQLiteStore: @unchecked Sendable {
                 """,
                 rows: totals.map { [.text($0.key.uuidString), .int($0.value)] }
             )
-            return try bumpRevision()
         }
     }
 
-    @discardableResult
-    func pruneMinuteData(before timestamp: Int64) throws -> Int64 {
-        try writeTransaction {
-            let changed = try prepared(
-                "DELETE FROM minute_device_counts WHERE bucket_start < ?",
-                bindings: [.int(timestamp)]
-            )
-            return changed > 0 ? try bumpRevision() : try revision()
-        }
+    func pruneMinuteData(before timestamp: Int64) throws {
+        try prepared(
+            "DELETE FROM minute_device_counts WHERE bucket_start < ?",
+            bindings: [.int(timestamp)]
+        )
     }
 
     // MARK: Read model
-
-    func revision() throws -> Int64 {
-        try intValue("SELECT revision FROM statistics_state WHERE singleton = 1") ?? 0
-    }
 
     func dashboard(
         connected: Set<UUID>,
@@ -423,10 +402,9 @@ final class SQLiteStore: @unchecked Sendable {
 
     // MARK: Device/count mutations
 
-    @discardableResult
-    func mergeDevice(source: UUID, target: UUID) throws -> Int64 {
+    func mergeDevice(source: UUID, target: UUID) throws {
+        guard source != target else { return }
         try writeTransaction {
-            guard source != target else { return try revision() }
             for table in ["minute_device_counts", "hourly_device_counts"] {
                 try prepared(
                     """
@@ -475,59 +453,31 @@ final class SQLiteStore: @unchecked Sendable {
             )
             try deleteDeviceRows(id: source)
             try prepared("DELETE FROM devices WHERE id = ?", bindings: [.text(source.uuidString)])
-            return try bumpRevision()
         }
     }
 
-    @discardableResult
-    func deleteDevice(id: UUID) throws -> Int64 {
+    func deleteDevice(id: UUID) throws {
         try writeTransaction {
-            let exists = try intValue(
-                "SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)",
-                bindings: [.text(id.uuidString)]
-            ) == 1
-            guard exists else { return try revision() }
             try deleteDeviceRows(id: id)
             try prepared("DELETE FROM devices WHERE id = ?", bindings: [.text(id.uuidString)])
-            return try bumpRevision()
         }
     }
 
-    @discardableResult
-    func clearAllCounts() throws -> Int64 {
+    func clearAllCounts() throws {
         try writeTransaction {
-            guard try hasAnyCounts(deviceID: nil) else { return try revision() }
             for table in Self.countTables { try run("DELETE FROM \(table);") }
-            return try bumpRevision()
         }
     }
 
-    @discardableResult
-    func clearCounts(deviceID: UUID) throws -> Int64 {
+    func clearCounts(deviceID: UUID) throws {
         try writeTransaction {
-            guard try hasAnyCounts(deviceID: deviceID) else { return try revision() }
             for table in Self.countTables {
                 try prepared(
                     "DELETE FROM \(table) WHERE device_id = ?",
                     bindings: [.text(deviceID.uuidString)]
                 )
             }
-            return try bumpRevision()
         }
-    }
-
-    private func hasAnyCounts(deviceID: UUID?) throws -> Bool {
-        let predicate = deviceID == nil ? "" : " WHERE device_id = ?"
-        let union = Self.countTables
-            .map { "SELECT 1 FROM \($0)\(predicate)" }
-            .joined(separator: " UNION ALL ")
-        let bindings = deviceID.map { id in
-            Array(repeating: SQLBinding.text(id.uuidString), count: Self.countTables.count)
-        } ?? []
-        return try intValue(
-            "SELECT EXISTS(SELECT 1 FROM (\(union)) LIMIT 1)",
-            bindings: bindings
-        ) == 1
     }
 
     private func deleteDeviceRows(id: UUID) throws {
@@ -545,7 +495,6 @@ final class SQLiteStore: @unchecked Sendable {
         guard try tableExists("devices") else {
             try writeTransaction {
                 try createSchema()
-                try run("INSERT INTO statistics_state (singleton, revision) VALUES (1, 0);")
                 try run("PRAGMA user_version = \(Self.schemaVersion);")
             }
             return
@@ -560,7 +509,7 @@ final class SQLiteStore: @unchecked Sendable {
             for trigger in ["insert", "update", "delete"] {
                 try run("DROP TRIGGER IF EXISTS mark_statistics_dirty_after_daily_\(trigger);")
             }
-            try run("ALTER TABLE statistics_state DROP COLUMN canonical_signature;")
+            try run("DROP TABLE IF EXISTS statistics_state;")
             try run("PRAGMA user_version = \(Self.schemaVersion);")
         }
         let backupURL = databaseURL.deletingLastPathComponent().appending(path: "clickclick-v1-backup.sqlite")
@@ -624,10 +573,6 @@ final class SQLiteStore: @unchecked Sendable {
             device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
             count INTEGER NOT NULL CHECK(count >= 0)
         );
-        CREATE TABLE IF NOT EXISTS statistics_state (
-            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-            revision INTEGER NOT NULL
-        );
         CREATE INDEX IF NOT EXISTS idx_minute_device ON minute_device_counts(device_id, bucket_start);
         CREATE INDEX IF NOT EXISTS idx_hourly_device ON hourly_device_counts(device_id, bucket_start);
         CREATE INDEX IF NOT EXISTS idx_daily_key_device ON daily_device_key_counts(device_id, local_day);
@@ -636,19 +581,12 @@ final class SQLiteStore: @unchecked Sendable {
         """)
     }
 
-    // MARK: State and date helpers
-
-    private func bumpRevision() throws -> Int64 {
-        try run("UPDATE statistics_state SET revision = revision + 1 WHERE singleton = 1;")
-        return try revision()
-    }
+    // MARK: Date helpers
 
     private static func completeMonths(fromDay: String, toDay: String) -> [String] {
-        guard let startComponents = dayComponents(fromDay),
-              let endComponents = dayComponents(toDay) else { return [] }
         let calendar = Calendar.autoupdatingCurrent
-        guard let start = calendar.date(from: startComponents),
-              let end = calendar.date(from: endComponents) else { return [] }
+        guard let start = TimeBuckets.date(fromLocalDay: fromDay, calendar: calendar),
+              let end = TimeBuckets.date(fromLocalDay: toDay, calendar: calendar) else { return [] }
         var cursor = calendar.date(
             from: calendar.dateComponents([.year, .month], from: start)
         )!
@@ -673,15 +611,11 @@ final class SQLiteStore: @unchecked Sendable {
         toDay: String,
         completeMonths: [String]
     ) -> [(from: String, to: String)] {
+        let calendar = Calendar.autoupdatingCurrent
         guard let firstMonth = completeMonths.first,
               let lastMonth = completeMonths.last,
-              let firstComponents = dayComponents("\(firstMonth)-01"),
-              let lastComponents = dayComponents("\(lastMonth)-01") else {
-            return [(fromDay, toDay)]
-        }
-        let calendar = Calendar.autoupdatingCurrent
-        guard let firstCompleteDay = calendar.date(from: firstComponents),
-              let lastCompleteDay = calendar.date(from: lastComponents),
+              let firstCompleteDay = TimeBuckets.date(fromLocalDay: "\(firstMonth)-01", calendar: calendar),
+              let lastCompleteDay = TimeBuckets.date(fromLocalDay: "\(lastMonth)-01", calendar: calendar),
               let headEndDate = calendar.date(byAdding: .day, value: -1, to: firstCompleteDay),
               let tailStartDate = calendar.date(byAdding: .month, value: 1, to: lastCompleteDay) else {
             return [(fromDay, toDay)]
@@ -693,12 +627,6 @@ final class SQLiteStore: @unchecked Sendable {
         if fromDay <= headEnd { ranges.append((fromDay, min(toDay, headEnd))) }
         if tailStart <= toDay { ranges.append((max(fromDay, tailStart), toDay)) }
         return ranges
-    }
-
-    private static func dayComponents(_ value: String) -> DateComponents? {
-        let parts = value.split(separator: "-").compactMap { Int($0) }
-        guard parts.count == 3 else { return nil }
-        return DateComponents(year: parts[0], month: parts[1], day: parts[2])
     }
 
     // MARK: SQLite primitives

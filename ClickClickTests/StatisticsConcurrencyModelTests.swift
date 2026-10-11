@@ -3,7 +3,9 @@ import Testing
 @testable import ClickClick
 
 struct StatisticsConcurrencyModelTests {
-    @Test @MainActor
+    private static let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+
+    @Test(.timeLimit(.minutes(1))) @MainActor
     func hostedTestsUseAnIsolatedDefaultDatabase() throws {
         #expect(ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil)
         let databaseURL = try AppModel.defaultDatabaseURL()
@@ -47,7 +49,6 @@ struct StatisticsConcurrencyModelTests {
         let query = StatisticsQuery(granularity: .day, deviceID: nil, now: date)
         let snapshot = StatisticsSnapshot(
             query: query,
-            revision: 7,
             devices: [visible, hidden],
             trend: [
                 TrendPoint(date: date, deviceID: hidden.id, deviceName: hidden.name, count: 99),
@@ -62,117 +63,219 @@ struct StatisticsConcurrencyModelTests {
         #expect(snapshot.summary.total == 4)
     }
 
-    @Test @MainActor
-    func viewModelIsLatestWinsAndDoesNotQueryWhileHidden() async throws {
+    @Test(.timeLimit(.minutes(1))) @MainActor
+    func latestQueryWinsAndInterruptsTheSupersededRead() async {
         let reader = StatisticsControlledReader()
-        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
         let publications = PublicationCounter()
-        let model = StatisticsViewModel(
-            reader: reader,
-            now: { fixedNow },
-            didPublish: { _ in publications.record() }
-        )
-
-        model.setGranularity(.day)
-        model.selectDevice(UUID())
-        model.retry()
-        #expect(reader.requestCount == 0)
+        let model = Self.makeModel(reader, publications)
 
         model.setVisible(true)
         let first = await reader.nextRequest()
-        #expect(first.query.granularity == .day)
+        #expect(first.query.granularity == .hour)
 
         model.setGranularity(.month)
         let second = await reader.nextRequest()
         #expect(second.query.granularity == .month)
         #expect(first.id != second.id)
-
-        let device = Self.device(id: UUID(), name: "Keyboard", hidden: false)
-        reader.succeed(
-            requestID: second.id,
-            with: StatisticsSnapshot(
-                query: second.query,
-                revision: 2,
-                devices: [device],
-                trend: [],
-                keyCounts: []
-            )
-        )
-        await publications.wait(until: 1)
-
-        #expect(model.snapshot?.query.granularity == .month)
-        #expect(publications.value == 1)
         #expect(reader.interruptCount >= 1)
 
+        reader.succeed(requestID: second.id, with: Self.snapshot(second.query))
+        await publications.wait(until: 1)
+        #expect(model.snapshot?.query.granularity == .month)
+        #expect(publications.value == 1)
         model.setVisible(false)
-        model.setGranularity(.week)
-        model.retry()
-        await Task.yield()
-        #expect(reader.requestCount == 2)
     }
 
-    @Test @MainActor
-    func hiddenViewDropsFlushPayloadsAndReloadsAtTheLatestRevision() async {
-        let reader = StatisticsControlledReader()
-        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
-        let deviceID = UUID()
+    @Test(.timeLimit(.minutes(1))) @MainActor
+    func staleCompletionsAreIgnored() async {
+        let reader = StatisticsControlledReader(ignoresInterrupt: true)
         let publications = PublicationCounter()
-        let model = StatisticsViewModel(
-            reader: reader,
-            granularity: .day,
-            now: { fixedNow },
-            didPublish: { _ in publications.record() }
-        )
-        let query = StatisticsQuery(granularity: .day, deviceID: nil, now: fixedNow)
-
-        for revision in 1...500 {
-            model.consume(Self.flushResult(
-                revision: Int64(revision),
-                deviceID: deviceID,
-                localDay: query.fromLocalDay
-            ))
-        }
-        #expect(reader.requestCount == 0)
-        #expect(model.bufferedRevisionCountForDiagnostics == 0)
+        let model = Self.makeModel(reader, publications)
+        let other = UUID()
 
         model.setVisible(true)
-        let staleRequest = await reader.nextRequest()
-        let device = Self.device(id: deviceID, name: "Keyboard", hidden: false)
-        reader.succeed(
-            requestID: staleRequest.id,
-            with: StatisticsSnapshot(
-                query: staleRequest.query,
-                revision: 499,
-                devices: [device],
-                trend: [],
-                keyCounts: []
-            )
-        )
+        let first = await reader.nextRequest()
+        model.selectDevice(other)
+        let second = await reader.nextRequest()
+        #expect(second.query.deviceID == other)
 
-        let currentRequest = await reader.nextRequest()
+        // The superseded read still finishes, but nobody may look at its result.
+        reader.succeed(requestID: first.id, with: Self.snapshot(first.query))
+        await settle()
         #expect(publications.value == 0)
-        reader.succeed(
-            requestID: currentRequest.id,
-            with: StatisticsSnapshot(
-                query: currentRequest.query,
-                revision: 500,
-                devices: [device],
-                trend: [],
-                keyCounts: []
-            )
-        )
+        #expect(model.snapshot == nil)
+        #expect(model.isLoading)
+
+        reader.succeed(requestID: second.id, with: Self.snapshot(second.query))
         await publications.wait(until: 1)
-        #expect(model.snapshot?.revision == 500)
-        #expect(model.bufferedRevisionCountForDiagnostics == 0)
+        #expect(model.snapshot?.query.deviceID == other)
+        #expect(!model.isLoading)
+        await settle()
+        #expect(publications.value == 1)
         model.setVisible(false)
     }
 
-    @Test @MainActor
-    func queryCrossingABucketBoundaryReloadsInsteadOfStayingLoading() async {
+    @Test(.timeLimit(.minutes(1))) @MainActor
+    func hiddenModelNeverReads() async {
         let reader = StatisticsControlledReader()
-        let clock = StatisticsMutableClock(
-            now: Date(timeIntervalSince1970: 1_800_000_059)
-        )
+        let model = Self.makeModel(reader)
+
+        model.setGranularity(.day)
+        model.selectDevice(UUID())
+        model.retry()
+        model.invalidateAndReload()
+        model.dataDidChange()
+        await settle()
+        #expect(reader.requestCount == 0)
+
+        model.setVisible(true)
+        let request = await reader.nextRequest()
+        #expect(request.query.granularity == .day)
+        #expect(model.isLoading)
+
+        model.setVisible(false)
+        #expect(!model.isLoading)
+        model.setGranularity(.week)
+        model.retry()
+        model.dataDidChange()
+        await settle()
+        #expect(reader.requestCount == 1)
+    }
+
+    @Test(.timeLimit(.minutes(1))) @MainActor
+    func changesWhileHiddenCauseExactlyOneReloadWhenShown() async {
+        let reader = StatisticsControlledReader()
+        let publications = PublicationCounter()
+        let model = Self.makeModel(reader, publications)
+
+        model.setVisible(true)
+        let first = await reader.nextRequest()
+        reader.succeed(requestID: first.id, with: Self.snapshot(first.query))
+        await publications.wait(until: 1)
+
+        model.setVisible(false)
+        for _ in 0..<500 { model.dataDidChange() }
+        await settle()
+        #expect(reader.requestCount == 1)
+
+        model.setVisible(true)
+        let second = await reader.nextRequest()
+        await settle()
+        #expect(reader.requestCount == 2)
+        #expect(!model.isLoading)
+        #expect(model.snapshot != nil)
+        reader.succeed(requestID: second.id, with: Self.snapshot(second.query, count: 3))
+        await publications.wait(until: 2)
+        #expect(model.snapshot?.summary.total == 3)
+
+        // Nothing changed this time, so showing the window again reads nothing.
+        model.setVisible(false)
+        model.setVisible(true)
+        await settle()
+        #expect(reader.requestCount == 2)
+        model.setVisible(false)
+    }
+
+    @Test(.timeLimit(.minutes(1))) @MainActor
+    func changeDuringAnInFlightLoadCausesExactlyOneFollowUpReload() async {
+        let reader = StatisticsControlledReader()
+        let publications = PublicationCounter()
+        let model = Self.makeModel(reader, publications)
+
+        model.setVisible(true)
+        let first = await reader.nextRequest()
+        for _ in 0..<5 { model.dataDidChange() }
+        await settle()
+        #expect(reader.requestCount == 1)
+        #expect(reader.interruptCount == 0)
+
+        reader.succeed(requestID: first.id, with: Self.snapshot(first.query))
+        await publications.wait(until: 1)
+        let second = await reader.nextRequest()
+        #expect(reader.requestCount == 2)
+        #expect(!model.isLoading)
+
+        reader.succeed(requestID: second.id, with: Self.snapshot(second.query, count: 1))
+        await publications.wait(until: 2)
+        await settle()
+        #expect(reader.requestCount == 2)
+        #expect(model.snapshot?.summary.total == 1)
+        model.setVisible(false)
+    }
+
+    @Test(.timeLimit(.minutes(1))) @MainActor
+    func backgroundReloadsDoNotShowTheLoadingIndicator() async {
+        let reader = StatisticsControlledReader()
+        let publications = PublicationCounter()
+        let model = Self.makeModel(reader, publications)
+
+        model.setVisible(true)
+        #expect(model.isLoading)
+        let first = await reader.nextRequest()
+        reader.succeed(requestID: first.id, with: Self.snapshot(first.query))
+        await publications.wait(until: 1)
+        #expect(!model.isLoading)
+
+        model.dataDidChange()
+        #expect(!model.isLoading)
+        let second = await reader.nextRequest()
+        #expect(!model.isLoading)
+        reader.succeed(requestID: second.id, with: Self.snapshot(second.query, count: 2))
+        await publications.wait(until: 2)
+        #expect(!model.isLoading)
+
+        model.invalidateAndReload()
+        #expect(!model.isLoading)
+        let third = await reader.nextRequest()
+
+        // A selection change or a retry replaces what the user is looking at.
+        model.setGranularity(.day)
+        #expect(model.isLoading)
+        let fourth = await reader.nextRequest()
+        #expect(third.id != fourth.id)
+        reader.succeed(requestID: fourth.id, with: Self.snapshot(fourth.query))
+        await publications.wait(until: 3)
+        #expect(!model.isLoading)
+
+        model.retry()
+        #expect(model.isLoading)
+        let fifth = await reader.nextRequest()
+        reader.succeed(requestID: fifth.id, with: Self.snapshot(fifth.query, count: 5))
+        await publications.wait(until: 4)
+        #expect(!model.isLoading)
+        model.setVisible(false)
+    }
+
+    @Test(.timeLimit(.minutes(1))) @MainActor
+    func unchangedSnapshotIsNotRepublished() async {
+        let reader = StatisticsControlledReader()
+        let publications = PublicationCounter()
+        let model = Self.makeModel(reader, publications)
+
+        model.setVisible(true)
+        let first = await reader.nextRequest()
+        reader.succeed(requestID: first.id, with: Self.snapshot(first.query, count: 4))
+        await publications.wait(until: 1)
+
+        model.dataDidChange()
+        let second = await reader.nextRequest()
+        reader.succeed(requestID: second.id, with: Self.snapshot(second.query, count: 4))
+
+        // The next request can only start after the second load finished.
+        model.dataDidChange()
+        let third = await reader.nextRequest()
+        #expect(publications.value == 1)
+
+        reader.succeed(requestID: third.id, with: Self.snapshot(third.query, count: 5))
+        await publications.wait(until: 2)
+        #expect(model.snapshot?.summary.total == 5)
+        model.setVisible(false)
+    }
+
+    @Test(.timeLimit(.minutes(1))) @MainActor
+    func queryCrossingABucketBoundaryDuringALoadReloadsInsteadOfStayingLoading() async {
+        let reader = StatisticsControlledReader()
+        let clock = StatisticsMutableClock(now: Date(timeIntervalSince1970: 1_800_000_059))
         let publications = PublicationCounter()
         let model = StatisticsViewModel(
             reader: reader,
@@ -184,200 +287,80 @@ struct StatisticsConcurrencyModelTests {
         model.setVisible(true)
         let expiredRequest = await reader.nextRequest()
         clock.now = Date(timeIntervalSince1970: 1_800_000_061)
-        reader.succeed(
-            requestID: expiredRequest.id,
-            with: StatisticsSnapshot(
-                query: expiredRequest.query,
-                revision: 1,
-                devices: [],
-                trend: [],
-                keyCounts: []
-            )
-        )
+        reader.succeed(requestID: expiredRequest.id, with: Self.snapshot(expiredRequest.query))
 
         let currentRequest = await reader.nextRequest()
         #expect(currentRequest.query != expiredRequest.query)
         #expect(publications.value == 0)
-        reader.succeed(
-            requestID: currentRequest.id,
-            with: StatisticsSnapshot(
-                query: currentRequest.query,
-                revision: 1,
-                devices: [],
-                trend: [],
-                keyCounts: []
-            )
-        )
+        #expect(model.isLoading)
+        reader.succeed(requestID: currentRequest.id, with: Self.snapshot(currentRequest.query))
         await publications.wait(until: 1)
         #expect(model.snapshot?.query == currentRequest.query)
         #expect(!model.isLoading)
         model.setVisible(false)
     }
 
-    @Test @MainActor
-    func unrelatedDeltaAdvancesWorkingRevisionWithoutPublishing() async {
+    @Test(.timeLimit(.minutes(1))) @MainActor
+    func visibleModelReloadsInTheBackgroundWhenTheBucketRollsOver() async {
         let reader = StatisticsControlledReader()
-        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
-        let selected = UUID()
-        let other = UUID()
+        // Close enough to the end of the bucket that the boundary timer is short.
+        let clock = StatisticsMutableClock(now: Date(timeIntervalSince1970: 1_800_000_059.99))
         let publications = PublicationCounter()
         let model = StatisticsViewModel(
             reader: reader,
-            granularity: .day,
-            selectedDeviceID: selected,
-            now: { fixedNow },
-            didPublish: { _ in publications.record() }
-        )
-
-        model.setVisible(true)
-        let request = await reader.nextRequest()
-        let selectedDevice = Self.device(id: selected, name: "Selected", hidden: false)
-        let otherDevice = Self.device(id: other, name: "Other", hidden: false)
-        reader.succeed(
-            requestID: request.id,
-            with: StatisticsSnapshot(
-                query: request.query,
-                revision: 10,
-                devices: [selectedDevice, otherDevice],
-                trend: [],
-                keyCounts: []
-            )
-        )
-        await publications.wait(until: 1)
-
-        let localDay = request.query.fromLocalDay
-        let unrelated = Self.flushResult(
-            revision: 11,
-            deviceID: other,
-            localDay: localDay
-        )
-        model.consume(unrelated)
-        #expect(publications.value == 1)
-
-        let relevant = Self.flushResult(
-            revision: 12,
-            deviceID: selected,
-            localDay: localDay
-        )
-        model.consume(relevant)
-        #expect(publications.value == 2)
-        #expect(model.snapshot?.revision == 12)
-        #expect(model.snapshot?.summary.total == 1)
-
-        model.setVisible(false)
-    }
-
-    @Test func emptyFlushReturnsNilAndWrittenFlushCarriesExactDelta() async throws {
-        let fixture = try StatisticsConcurrencyFixture()
-        let engine = try StatisticsEngine(databaseURL: fixture.databaseURL)
-        #expect(try await engine.flush() == nil)
-
-        let device = try await engine.registerDevice(
-            referenceID: 1,
-            descriptor: fixture.descriptor
-        )
-        let date = Date(timeIntervalSince1970: 1_800_000_000)
-        await engine.record(
-            deviceID: device,
-            key: HIDKeyID(usagePage: 7, usage: 4),
-            at: date
-        )
-        let flushed = try await engine.flush()
-        let result = try #require(flushed)
-
-        #expect(result.deltas.count == 1)
-        #expect(result.deltas[0].deviceID == device)
-        #expect(result.deltas[0].count == 1)
-        #expect(result.invalidation.scope == .counts)
-        let dashboard = try await engine.dashboard()
-        #expect(dashboard.revision == result.revision)
-        #expect(dashboard.snapshot.devices.first { $0.id == device }?.totalCount == 1)
-        #expect(try await engine.flush() == nil)
-    }
-
-    @Test @MainActor
-    func inFlightCountFlushesAreBufferedAndRevisionGapTriggersOneReload() async {
-        let reader = StatisticsControlledReader()
-        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
-        let deviceID = UUID()
-        let publications = PublicationCounter()
-        let model = StatisticsViewModel(
-            reader: reader,
-            granularity: .day,
-            selectedDeviceID: deviceID,
-            now: { fixedNow },
+            granularity: .minute,
+            now: { clock.now },
             didPublish: { _ in publications.record() }
         )
 
         model.setVisible(true)
         let first = await reader.nextRequest()
-        model.consume(Self.flushResult(revision: 11, deviceID: deviceID, localDay: first.query.fromLocalDay))
-        model.consume(Self.flushResult(revision: 12, deviceID: deviceID, localDay: first.query.fromLocalDay))
-        #expect(reader.requestCount == 1)
-
-        let device = Self.device(id: deviceID, name: "Keyboard", hidden: false)
-        reader.succeed(
-            requestID: first.id,
-            with: StatisticsSnapshot(
-                query: first.query,
-                revision: 10,
-                devices: [device],
-                trend: [],
-                keyCounts: []
-            )
-        )
+        reader.succeed(requestID: first.id, with: Self.snapshot(first.query))
         await publications.wait(until: 1)
-        #expect(model.snapshot?.revision == 12)
-        #expect(model.snapshot?.summary.total == 2)
-        #expect(reader.requestCount == 1)
 
-        model.consume(Self.flushResult(revision: 14, deviceID: deviceID, localDay: first.query.fromLocalDay))
+        clock.now = Date(timeIntervalSince1970: 1_800_000_061)
         let second = await reader.nextRequest()
-        #expect(reader.requestCount == 2)
-        reader.succeed(
-            requestID: second.id,
-            with: StatisticsSnapshot(
-                query: second.query,
-                revision: 14,
-                devices: [device],
-                trend: [],
-                keyCounts: []
-            )
-        )
+        #expect(second.query != first.query)
+        #expect(!model.isLoading)
+        reader.succeed(requestID: second.id, with: Self.snapshot(second.query))
         await publications.wait(until: 2)
-        await Task.yield()
-        #expect(reader.requestCount == 2)
-        #expect(model.snapshot?.revision == 14)
+        #expect(model.snapshot?.query == second.query)
         model.setVisible(false)
     }
 
-    private static func flushResult(
-        revision: Int64,
-        deviceID: UUID,
-        localDay: String
-    ) -> FlushResult {
-        let calendar = Calendar.autoupdatingCurrent
-        let day = calendar.date(
-            from: DateComponents(
-                year: Int(localDay.prefix(4)),
-                month: Int(localDay.dropFirst(5).prefix(2)),
-                day: Int(localDay.suffix(2))
-            )
-        ) ?? Date()
-        let delta = FlushDelta(
-            minuteBucket: TimeBuckets.minute(for: day),
-            hourBucket: TimeBuckets.hour(for: day),
-            localDay: localDay,
-            deviceID: deviceID,
-            key: HIDKeyID(usagePage: 7, usage: 4),
-            count: 1
-        )
-        return FlushResult(
-            revision: revision,
-            deltas: [delta],
-            invalidation: .counts(revision: revision, deltas: [delta])
+    // MARK: Helpers
+
+    @MainActor
+    private static func makeModel(
+        _ reader: StatisticsControlledReader,
+        _ publications: PublicationCounter? = nil
+    ) -> StatisticsViewModel {
+        StatisticsViewModel(
+            reader: reader,
+            now: { fixedNow },
+            didPublish: { _ in publications?.record() }
         )
     }
+
+    /// `count` > 0 adds one trend point so snapshots can be told apart.
+    private static func snapshot(_ query: StatisticsQuery, count: Int64 = 0) -> StatisticsSnapshot {
+        let keyboard = device(id: Self.keyboardID, name: "Keyboard", hidden: false)
+        return StatisticsSnapshot(
+            query: query,
+            devices: [keyboard],
+            trend: count == 0 ? [] : [
+                TrendPoint(
+                    date: query.currentBucketStart,
+                    deviceID: keyboard.id,
+                    deviceName: keyboard.name,
+                    count: count
+                )
+            ],
+            keyCounts: []
+        )
+    }
+
+    private static let keyboardID = UUID()
 
     private static func device(id: UUID, name: String, hidden: Bool) -> KeyboardDevice {
         KeyboardDevice(
@@ -392,6 +375,13 @@ struct StatisticsConcurrencyModelTests {
             totalCount: 0
         )
     }
+}
+
+/// Lets already-enqueued main actor work run. Only used before asserting that
+/// something did not happen, so it can hide a bug but never fail a correct run.
+@MainActor
+private func settle() async {
+    for _ in 0..<20 { await Task.yield() }
 }
 
 @MainActor
@@ -426,12 +416,19 @@ private final class StatisticsControlledReader: StatisticsSnapshotReading, @unch
     }
 
     private let lock = NSLock()
+    private let ignoresInterrupt: Bool
     private var nextID = 0
     private var pending: [Int: Pending] = [:]
     private var queuedRequests: [Request] = []
     private var requestWaiters: [CheckedContinuation<Request, Never>] = []
     private var _requestCount = 0
     private var _interruptCount = 0
+
+    /// A reader that ignores `interrupt()` still completes superseded reads,
+    /// which is how a late result from a cancelled query shows up.
+    init(ignoresInterrupt: Bool = false) {
+        self.ignoresInterrupt = ignoresInterrupt
+    }
 
     var requestCount: Int { withLock { _requestCount } }
     var interruptCount: Int { withLock { _interruptCount } }
@@ -462,6 +459,7 @@ private final class StatisticsControlledReader: StatisticsSnapshotReading, @unch
     func interrupt() {
         let continuations: [CheckedContinuation<StatisticsSnapshot, Error>] = withLock {
             _interruptCount += 1
+            guard !ignoresInterrupt else { return [] }
             let values = pending.values.map(\.continuation)
             pending.removeAll()
             return values
@@ -493,32 +491,6 @@ private final class StatisticsControlledReader: StatisticsSnapshotReading, @unch
         lock.lock()
         defer { lock.unlock() }
         return body()
-    }
-}
-
-private struct StatisticsConcurrencyFixture {
-    let root: URL
-    var databaseURL: URL { root.appending(path: "statistics-concurrency.sqlite") }
-
-    init() throws {
-        root = FileManager.default.temporaryDirectory.appending(
-            path: "statistics-concurrency-\(UUID().uuidString)",
-            directoryHint: .isDirectory
-        )
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-    }
-
-    var descriptor: DeviceDescriptor {
-        DeviceDescriptor(
-            observedFingerprint: "statistics-concurrency-device",
-            suggestedName: "Statistics Test Device",
-            manufacturer: "Test",
-            product: "Test",
-            vendorID: 1,
-            productID: 2,
-            transport: "USB",
-            isBuiltIn: false
-        )
     }
 }
 

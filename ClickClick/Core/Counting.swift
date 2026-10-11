@@ -101,6 +101,12 @@ enum TimeBuckets {
         return String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
     }
 
+    static func date(fromLocalDay value: String, calendar: Calendar) -> Date? {
+        let parts = value.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        return calendar.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))
+    }
+
     static func start(of granularity: TrendGranularity, for date: Date, calendar: Calendar) -> Date {
         switch granularity {
         case .minute:

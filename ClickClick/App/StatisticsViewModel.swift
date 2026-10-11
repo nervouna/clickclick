@@ -4,7 +4,7 @@ import Observation
 @MainActor
 @Observable
 final class StatisticsViewModel {
-    private(set) var snapshot: StatisticsViewSnapshot?
+    private(set) var snapshot: StatisticsSnapshot?
     private(set) var isLoading = false
     private(set) var errorMessage: String?
     private(set) var granularity: TrendGranularity
@@ -13,12 +13,14 @@ final class StatisticsViewModel {
     @ObservationIgnored private let reader: any StatisticsSnapshotReading
     @ObservationIgnored private let now: @MainActor @Sendable () -> Date
     @ObservationIgnored private let didPublish: (@MainActor @Sendable (StatisticsSnapshot) -> Void)?
-    @ObservationIgnored private var workingSnapshot: StatisticsSnapshot?
     @ObservationIgnored private var isVisible = false
-    @ObservationIgnored private var needsReload = true
+    /// The database may have changed since the last load started.
+    @ObservationIgnored private var needsReload = false
+    /// The next load replaces content the user is looking at (first load, new
+    /// selection, retry), so it shows the loading indicator. Background
+    /// reloads after data changes do not.
+    @ObservationIgnored private var showsLoading = true
     @ObservationIgnored private var generation: UInt64 = 0
-    @ObservationIgnored private var latestRevisionSeen: Int64 = 0
-    @ObservationIgnored private var bufferedResults: [Int64: FlushResult] = [:]
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var boundaryTask: Task<Void, Never>?
 
@@ -36,27 +38,22 @@ final class StatisticsViewModel {
         self.didPublish = didPublish
     }
 
-    var bufferedRevisionCountForDiagnostics: Int { bufferedResults.count }
-
     func setVisible(_ visible: Bool) {
         guard isVisible != visible else { return }
         isVisible = visible
 
         if visible {
             let query = makeQuery()
-            if let workingSnapshot,
-               workingSnapshot.query == query,
-               !needsReload {
-                publish(workingSnapshot)
-                scheduleBoundary(for: query)
+            if needsReload || snapshot?.query != query {
+                reload()
             } else {
-                reload(for: query)
+                scheduleBoundary(for: query)
             }
         } else {
+            if loadTask != nil { needsReload = true }
             cancelLoad()
             boundaryTask?.cancel()
             boundaryTask = nil
-            bufferedResults.removeAll(keepingCapacity: false)
             if isLoading { isLoading = false }
         }
     }
@@ -74,118 +71,51 @@ final class StatisticsViewModel {
     }
 
     func retry() {
-        needsReload = true
-        guard isVisible else { return }
-        reload(for: makeQuery())
+        showsLoading = true
+        invalidateAndReload()
     }
 
     func invalidateAndReload() {
         needsReload = true
         guard isVisible else { return }
-        reload(for: makeQuery())
+        reload()
     }
 
-    func consume(_ result: FlushResult) {
-        guard result.revision > (workingSnapshot?.revision ?? 0) else { return }
-        latestRevisionSeen = max(latestRevisionSeen, result.revision)
-
-        // A hidden statistics window will issue a consistent full read when it
-        // is shown again. Retaining every intervening delta would be unbounded
-        // and provides no value because there is no visible snapshot to patch.
-        guard isVisible else {
-            needsReload = true
-            bufferedResults.removeAll(keepingCapacity: false)
-            return
-        }
-
-        bufferedResults[result.revision] = result
-
-        if isLoading {
-            // Count flushes are deliberately buffered. Restarting a long read
-            // every two seconds could otherwise prevent its first result from
-            // ever becoming visible.
-            if result.invalidation.scope == .full, isVisible {
-                needsReload = true
-                reload(for: makeQuery())
-            }
-            return
-        }
-
-        guard let workingSnapshot,
-              workingSnapshot.query == makeQuery() else {
-            needsReload = true
-            if isVisible { reload(for: makeQuery()) }
-            return
-        }
-
-        guard result.revision == workingSnapshot.revision + 1 else {
-            needsReload = true
-            if isVisible { reload(for: workingSnapshot.query) }
-            return
-        }
-
-        guard result.invalidation.scope == .counts else {
-            needsReload = true
-            if isVisible { reload(for: workingSnapshot.query) }
-            return
-        }
-
-        guard let updated = workingSnapshot.applying(result) else {
-            needsReload = true
-            if isVisible { reload(for: workingSnapshot.query) }
-            return
-        }
-
-        self.workingSnapshot = updated
-        bufferedResults.removeValue(forKey: result.revision)
-        needsReload = false
-
-        // Advancing an unrelated revision is internal bookkeeping. Publishing
-        // it would needlessly invalidate the entire statistics hierarchy.
-        if isVisible, workingSnapshot.affectsVisibleContent(in: result) {
-            publish(updated)
-        }
+    /// Called after the database changed. A hidden window reloads when shown. A
+    /// load that is already running is never restarted, so a steady stream of
+    /// changes cannot starve it; one more load follows when it finishes.
+    func dataDidChange() {
+        needsReload = true
+        guard isVisible, loadTask == nil else { return }
+        reload()
     }
 
     private func querySelectionDidChange() {
-        needsReload = true
+        showsLoading = true
         boundaryTask?.cancel()
         boundaryTask = nil
         guard isVisible else { return }
-        reload(for: makeQuery())
+        reload()
     }
 
-    private func reload(for query: StatisticsQuery) {
-        guard isVisible else {
-            needsReload = true
-            return
-        }
-
+    private func reload() {
         cancelLoad()
-        generation &+= 1
+        needsReload = false
         let requestGeneration = generation
+        let query = makeQuery()
         let reader = self.reader
-        if !isLoading { isLoading = true }
-        if errorMessage != nil { errorMessage = nil }
+        if isLoading != showsLoading { isLoading = showsLoading }
 
         loadTask = Task { [weak self] in
             do {
                 let loaded = try await reader.snapshot(for: query)
                 guard !Task.isCancelled else { return }
-                self?.finishLoading(
-                    loaded,
-                    query: query,
-                    generation: requestGeneration
-                )
+                self?.finishLoading(loaded, query: query, generation: requestGeneration)
             } catch is CancellationError {
                 // A newer query or a hidden window owns the state now.
             } catch {
                 guard !Task.isCancelled else { return }
-                self?.finishLoading(
-                    error: error,
-                    query: query,
-                    generation: requestGeneration
-                )
+                self?.finishLoading(error: error, generation: requestGeneration)
             }
         }
     }
@@ -196,80 +126,41 @@ final class StatisticsViewModel {
         generation requestGeneration: UInt64
     ) {
         guard isVisible, requestGeneration == generation else { return }
-        let currentQuery = makeQuery()
-        guard query == currentQuery else {
-            needsReload = true
-            if isLoading { isLoading = false }
-            loadTask = nil
-            reload(for: currentQuery)
+        loadTask = nil
+        guard query == makeQuery() else {
+            // The bucket rolled over while the read was running.
+            reload()
             return
         }
 
-        var caughtUp = loaded
-        bufferedResults = bufferedResults.filter { $0.key > loaded.revision }
-
-        while let result = bufferedResults[caughtUp.revision + 1] {
-            guard result.invalidation.scope == .counts,
-                  let updated = caughtUp.applying(result) else {
-                break
-            }
-            caughtUp = updated
-            bufferedResults.removeValue(forKey: result.revision)
-        }
-
-        latestRevisionSeen = max(latestRevisionSeen, loaded.revision)
-        guard caughtUp.revision >= latestRevisionSeen else {
-            // One reload resolves either a full invalidation or a missing
-            // revision. Keep the old public snapshot visible in the meantime.
-            workingSnapshot = caughtUp
-            needsReload = true
-            if isLoading { isLoading = false }
-            loadTask = nil
-            reload(for: query)
-            return
-        }
-
-        workingSnapshot = caughtUp
-        needsReload = false
+        showsLoading = false
         if isLoading { isLoading = false }
         if errorMessage != nil { errorMessage = nil }
-        publish(caughtUp)
+        publish(loaded)
         scheduleBoundary(for: query)
-        loadTask = nil
+        if needsReload { reload() }
     }
 
-    private func finishLoading(
-        error: Error,
-        query: StatisticsQuery,
-        generation requestGeneration: UInt64
-    ) {
+    private func finishLoading(error: Error, generation requestGeneration: UInt64) {
         guard isVisible, requestGeneration == generation else { return }
-        let currentQuery = makeQuery()
-        guard query == currentQuery else {
-            needsReload = true
-            if isLoading { isLoading = false }
-            loadTask = nil
-            reload(for: currentQuery)
-            return
-        }
-        if isLoading { isLoading = false }
+        loadTask = nil
         needsReload = true
+        if isLoading { isLoading = false }
         let message = error.localizedDescription
         if errorMessage != message { errorMessage = message }
-        loadTask = nil
     }
 
     private func publish(_ value: StatisticsSnapshot) {
-        if snapshot != value {
-            snapshot = value
-            didPublish?(value)
-        }
+        guard snapshot != value else { return }
+        snapshot = value
+        didPublish?(value)
     }
 
     private func cancelLoad() {
         generation &+= 1
-        loadTask?.cancel()
-        loadTask = nil
+        guard let loadTask else { return }
+        loadTask.cancel()
+        self.loadTask = nil
         reader.interrupt()
     }
 
@@ -288,13 +179,11 @@ final class StatisticsViewModel {
                 return
             }
             guard !Task.isCancelled, let self, self.isVisible else { return }
-            let nextQuery = self.makeQuery()
-            guard nextQuery != query else {
+            guard self.makeQuery() != query else {
                 self.scheduleBoundary(for: query)
                 return
             }
-            self.needsReload = true
-            self.reload(for: nextQuery)
+            self.reload()
         }
     }
 

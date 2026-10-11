@@ -21,7 +21,6 @@ actor StatisticsReader {
             try handle.store.readTransaction {
                 StatisticsSnapshot(
                     query: query,
-                    revision: try handle.store.revision(),
                     devices: try handle.store.fetchDevices(connected: []),
                     trend: try readTrend(for: query),
                     keyCounts: try handle.store.keyCounts(
@@ -34,18 +33,10 @@ actor StatisticsReader {
         }
     }
 
-    func dashboard(connected: Set<UUID>) throws -> RevisionedDashboardSnapshot {
+    func dashboard(connected: Set<UUID>) throws -> DashboardSnapshot {
         try withCancellableRead {
-            let localDay = TimeBuckets.localDay(for: Date())
-            return try handle.store.readTransaction {
-                RevisionedDashboardSnapshot(
-                    revision: try handle.store.revision(),
-                    localDay: localDay,
-                    snapshot: try handle.store.dashboard(
-                        connected: connected,
-                        localDay: localDay
-                    )
-                )
+            try handle.store.readTransaction {
+                try handle.store.dashboard(connected: connected)
             }
         }
     }
@@ -80,7 +71,7 @@ actor StatisticsReader {
             )
             for row in rows {
                 try Task.checkCancellation()
-                guard let rawDate = Self.date(fromLocalDay: row.localDay, calendar: calendar) else {
+                guard let rawDate = TimeBuckets.date(fromLocalDay: row.localDay, calendar: calendar) else {
                     continue
                 }
                 let bucket = TimeBuckets.start(of: granularity, for: rawDate, calendar: calendar)
@@ -119,14 +110,6 @@ actor StatisticsReader {
             }
             throw error
         }
-    }
-
-    private static func date(fromLocalDay value: String, calendar: Calendar) -> Date? {
-        let parts = value.split(separator: "-").compactMap { Int($0) }
-        guard parts.count == 3 else { return nil }
-        return calendar.date(
-            from: DateComponents(year: parts[0], month: parts[1], day: parts[2])
-        )
     }
 }
 

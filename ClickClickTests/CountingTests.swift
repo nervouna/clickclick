@@ -198,7 +198,6 @@ struct CountingTests {
 
         let snapshot = StatisticsSnapshot(
             query: query,
-            revision: 1,
             devices: [device],
             trend: [point(starts[100], 300), point(starts[150], 100)],
             keyCounts: []
@@ -210,7 +209,7 @@ struct CountingTests {
         #expect(snapshot.summary.activeDeviceCount == 1)
         #expect(snapshot.trend.count == 2)
 
-        let empty = StatisticsSnapshot(query: query, revision: 1, devices: [device], trend: [], keyCounts: [])
+        let empty = StatisticsSnapshot(query: query, devices: [device], trend: [], keyCounts: [])
         #expect(empty.summary == .empty)
     }
 

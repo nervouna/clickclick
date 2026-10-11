@@ -6,12 +6,13 @@ import Testing
 struct SQLiteStoreTests {
     @Test func freshDatabaseGetsTheCurrentSchema() throws {
         let fixture = try StoreFixture()
-        let store = try SQLiteStore(url: fixture.databaseURL)
+        _ = try SQLiteStore(url: fixture.databaseURL)
 
-        #expect(try store.revision() == 0)
         #expect(try fixture.int("PRAGMA user_version") == Int64(SQLiteStore.schemaVersion))
         #expect(try fixture.int("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'") == 0)
-        #expect(try fixture.int("SELECT COUNT(*) FROM pragma_table_info('statistics_state')") == 2)
+        #expect(try fixture.int("SELECT COUNT(*) FROM sqlite_master WHERE name = 'statistics_state'") == 0)
+        #expect(try fixture.int("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'device_total_counts'") == 1)
+        try fixture.expectEveryCountTable(total: 0)
     }
 
     @Test func keyQueryCombinesPartialEdgesWithCompleteMiddleMonths() throws {
@@ -59,22 +60,19 @@ struct SQLiteStoreTests {
         #expect(devices.first(where: { $0.id == visible })?.totalCount == 39)
         #expect(devices.first(where: { $0.id == hidden })?.totalCount == 17)
 
-        let revisionBeforeMerge = try store.revision()
-        let mergeRevision = try store.mergeDevice(source: hidden, target: visible)
-        #expect(mergeRevision == revisionBeforeMerge + 1)
+        try store.mergeDevice(source: hidden, target: visible)
         let merged = try store.fetchDevices(connected: [])
         #expect(merged.count == 1)
         #expect(merged[0].totalCount == 56)
         try fixture.expectEveryCountTable(total: 56)
 
-        let clearRevision = try store.clearCounts(deviceID: visible)
-        #expect(clearRevision == mergeRevision + 1)
+        try store.clearCounts(deviceID: visible)
         #expect(try store.fetchDevices(connected: [visible])[0].totalCount == 0)
         #expect(try store.dailyTrendRows(fromDay: "2026-01-01", toDay: "2026-02-28", deviceID: nil).isEmpty)
         #expect(try store.keyCounts(fromDay: "2026-01-01", toDay: "2026-02-28", deviceID: nil).isEmpty)
         try fixture.expectEveryCountTable(total: 0)
 
-        let applyRevision = try store.apply([
+        try store.apply([
             CountIncrement(
                 minute: 60,
                 hour: 0,
@@ -85,25 +83,23 @@ struct SQLiteStoreTests {
             )
         ])
         try fixture.expectEveryCountTable(total: 4)
-        #expect(try store.clearAllCounts() == applyRevision + 1)
+        try store.clearAllCounts()
         try fixture.expectEveryCountTable(total: 0)
         #expect(try store.fetchDevices(connected: [])[0].id == visible)
 
-        let deleteRevision = try store.deleteDevice(id: visible)
-        #expect(deleteRevision == applyRevision + 2)
+        try store.deleteDevice(id: visible)
         #expect(try store.fetchDevices(connected: []).isEmpty)
     }
 
-    @Test func applyPreaggregatesBucketsAndAdvancesRevisionExactlyOnce() throws {
+    @Test func applyPreaggregatesBucketsIntoEveryCountTable() throws {
         let fixture = try StoreFixture()
         let store = try SQLiteStore(url: fixture.databaseURL)
         let deviceID = try store.resolveDevice(fixture.descriptor("fixture-device", name: "Fixture"))
-        let baseline = try store.revision()
         let date = Date(timeIntervalSince1970: 1_800_000_000)
         let minute = TimeBuckets.minute(for: date)
         let hour = TimeBuckets.hour(for: date)
         let day = TimeBuckets.localDay(for: date)
-        let revision = try store.apply([
+        try store.apply([
             CountIncrement(
                 minute: minute,
                 hour: hour,
@@ -122,36 +118,38 @@ struct SQLiteStoreTests {
             )
         ])
 
-        #expect(revision == baseline + 1)
         #expect(try fixture.int("SELECT COUNT(*) FROM minute_device_counts") == 1)
         #expect(try fixture.int("SELECT count FROM minute_device_counts") == 8)
         #expect(try fixture.int("SELECT COUNT(*) FROM hourly_device_counts") == 1)
         #expect(try fixture.int("SELECT count FROM daily_device_counts") == 8)
         #expect(try fixture.int("SELECT count FROM device_total_counts") == 8)
         #expect(try fixture.int("SELECT SUM(count) FROM monthly_device_key_counts") == 8)
-        #expect(try store.apply([]) == revision)
+
+        try store.apply([])
+        try fixture.expectEveryCountTable(total: 8)
     }
 
-    @Test func cleanMutationNoOpsDoNotAdvanceRevision() throws {
+    @Test func noOpMutationsLeaveTheCountTablesUntouched() throws {
         let fixture = try StoreFixture()
         let store = try SQLiteStore(url: fixture.databaseURL)
         let (visible, _) = try fixture.seed(store)
-        let baseline = try store.revision()
 
-        #expect(try store.mergeDevice(source: visible, target: visible) == baseline)
-        #expect(try store.clearCounts(deviceID: UUID()) == baseline)
-        #expect(try store.deleteDevice(id: UUID()) == baseline)
-        #expect(try store.apply([]) == baseline)
-        #expect(try store.revision() == baseline)
+        try store.mergeDevice(source: visible, target: visible)
+        try store.clearCounts(deviceID: UUID())
+        try store.deleteDevice(id: UUID())
+        try store.apply([])
+        try store.pruneMinuteData(before: 0)
+        try fixture.expectEveryCountTable(total: 56)
+        #expect(try store.fetchDevices(connected: []).count == 2)
 
         try store.clearAllCounts()
-        let cleared = try store.revision()
-        #expect(cleared == baseline + 1)
-        #expect(try store.clearAllCounts() == cleared)
-        #expect(try store.pruneMinuteData(before: Int64.max) == cleared)
+        try store.clearAllCounts()
+        try fixture.expectEveryCountTable(total: 0)
+        try store.pruneMinuteData(before: Int64.max)
+        try fixture.expectEveryCountTable(total: 0)
     }
 
-    @Test func opensSchemaV2DatabaseAndDropsTheDriftMachinery() throws {
+    @Test func opensSchemaV2DatabaseAndDropsTheRevisionMachinery() throws {
         let fixture = try StoreFixture()
         let device = "11111111-1111-1111-1111-111111111111"
         try fixture.execute("""
@@ -203,7 +201,6 @@ struct SQLiteStoreTests {
             );
             CREATE TABLE statistics_state (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                revision INTEGER NOT NULL,
                 canonical_signature TEXT NOT NULL
             );
             CREATE TRIGGER mark_statistics_dirty_after_daily_insert
@@ -227,7 +224,7 @@ struct SQLiteStoreTests {
             INSERT INTO daily_device_counts VALUES ('2026-01-15', '\(device)', 5);
             INSERT INTO monthly_device_key_counts VALUES ('2026-01', '\(device)', 7, 4, 5);
             INSERT INTO device_total_counts VALUES ('\(device)', 5);
-            INSERT INTO statistics_state VALUES (1, 7, 'v1:5');
+            INSERT INTO statistics_state VALUES (1, 'v1:5');
             PRAGMA user_version = 2;
             """)
         try Data("stale backup".utf8).write(to: fixture.backupURL)
@@ -236,33 +233,26 @@ struct SQLiteStoreTests {
 
         #expect(try fixture.int("PRAGMA user_version") == 3)
         #expect(try fixture.int("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'") == 0)
-        #expect(
-            try fixture.int(
-                "SELECT COUNT(*) FROM pragma_table_info('statistics_state') WHERE name = 'canonical_signature'"
-            ) == 0
-        )
+        #expect(try fixture.int("SELECT COUNT(*) FROM sqlite_master WHERE name = 'statistics_state'") == 0)
         #expect(!FileManager.default.fileExists(atPath: fixture.backupURL.path))
-        #expect(try store.revision() == 7)
         try fixture.expectEveryCountTable(total: 5)
         #expect(try store.fetchDevices(connected: [])[0].totalCount == 5)
 
         // The migrated store keeps writing, and reopening it is a no-op.
         let id = try #require(UUID(uuidString: device))
-        #expect(
-            try store.apply([
-                CountIncrement(
-                    minute: 60,
-                    hour: 0,
-                    localDay: "2026-01-15",
-                    deviceID: id,
-                    key: HIDKeyID(usagePage: 7, usage: 4),
-                    count: 2
-                )
-            ]) == 8
-        )
+        try store.apply([
+            CountIncrement(
+                minute: 60,
+                hour: 0,
+                localDay: "2026-01-15",
+                deviceID: id,
+                key: HIDKeyID(usagePage: 7, usage: 4),
+                count: 2
+            )
+        ])
         _ = try SQLiteStore(url: fixture.databaseURL)
         #expect(try fixture.int("PRAGMA user_version") == 3)
-        #expect(try fixture.int("SELECT revision FROM statistics_state") == 8)
+        #expect(try fixture.int("SELECT COUNT(*) FROM sqlite_master WHERE name = 'statistics_state'") == 0)
         try fixture.expectEveryCountTable(total: 7)
     }
 

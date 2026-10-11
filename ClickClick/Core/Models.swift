@@ -154,15 +154,6 @@ struct StatisticsQuery: Hashable, Sendable, Identifiable {
         TimeBuckets.localDay(for: rangeEnd.addingTimeInterval(-0.001), calendar: calendar)
     }
 
-    func contains(localDay: String) -> Bool {
-        localDay >= fromLocalDay && localDay <= throughLocalDay
-    }
-
-    func contains(bucket timestamp: Int64) -> Bool {
-        timestamp >= Int64(rangeStart.timeIntervalSince1970)
-            && timestamp < Int64(rangeEnd.timeIntervalSince1970)
-    }
-
     /// Every bucket start in `[rangeStart, rangeEnd)`, using the same bucketing as the statistics reader.
     var bucketStarts: [Date] {
         let calendar = calendar
@@ -203,11 +194,9 @@ struct StatisticsSummary: Equatable, Sendable {
 
 struct StatisticsSnapshot: Equatable, Sendable {
     let query: StatisticsQuery
-    let revision: Int64
     let rangeStart: Date
     let rangeEnd: Date
     let devices: [KeyboardDevice]
-    private let allDevices: [KeyboardDevice]
     let trend: [TrendPoint]
     let keyboardRanking: [KeyCount]
     let consumerRanking: [KeyCount]
@@ -218,7 +207,6 @@ struct StatisticsSnapshot: Equatable, Sendable {
 
     init(
         query: StatisticsQuery,
-        revision: Int64,
         devices: [KeyboardDevice],
         trend: [TrendPoint],
         keyCounts: [KeyCount]
@@ -244,10 +232,8 @@ struct StatisticsSnapshot: Equatable, Sendable {
         } ?? 0
 
         self.query = query
-        self.revision = revision
         rangeStart = query.rangeStart
         rangeEnd = query.rangeEnd
-        allDevices = devices
         self.devices = devices.filter { !$0.isHidden }.sorted { lhs, rhs in
             lhs.isBuiltIn == rhs.isBuiltIn ? lhs.name < rhs.name : lhs.isBuiltIn && !rhs.isBuiltIn
         }
@@ -263,166 +249,6 @@ struct StatisticsSnapshot: Equatable, Sendable {
         heatmapCounts = counts
         heatmapMaximum = Double(keyboard.map(\.count).max() ?? 1)
         heatmapMediaCounts = Array(consumer.prefix(8))
-    }
-
-    func applying(_ result: FlushResult) -> StatisticsSnapshot? {
-        guard result.revision == revision + 1 else { return nil }
-        guard result.invalidation.scope == .counts else { return nil }
-        guard result.invalidation.affects(query) else {
-            return StatisticsSnapshot(
-                query: query,
-                revision: result.revision,
-                devices: allDevices,
-                trend: trend,
-                keyCounts: heatmapCounts.map { KeyCount(key: $0.key, count: $0.value) }
-            )
-        }
-
-        var updatedDevices = allDevices
-        var trendByID = Dictionary(uniqueKeysWithValues: trend.map { ($0.id, $0) })
-        var keys = heatmapCounts
-        let calendar = query.calendar
-
-        for delta in result.deltas where query.deviceID == nil || query.deviceID == delta.deviceID {
-            guard query.contains(localDay: delta.localDay) else { continue }
-            guard let deviceIndex = updatedDevices.firstIndex(where: { $0.id == delta.deviceID }) else {
-                return nil
-            }
-            updatedDevices[deviceIndex].totalCount += delta.count
-            if updatedDevices[deviceIndex].isHidden { continue }
-
-            let rawDate: Date
-            switch query.granularity {
-            case .minute:
-                guard query.contains(bucket: delta.minuteBucket) else { continue }
-                rawDate = Date(timeIntervalSince1970: TimeInterval(delta.minuteBucket))
-            case .hour:
-                guard query.contains(bucket: delta.hourBucket) else { continue }
-                rawDate = Date(timeIntervalSince1970: TimeInterval(delta.hourBucket))
-            case .day, .week, .month:
-                guard let day = Self.date(fromLocalDay: delta.localDay, calendar: calendar) else { return nil }
-                rawDate = day
-            }
-
-            let bucket = TimeBuckets.start(of: query.granularity, for: rawDate, calendar: calendar)
-            let pointID = TrendPointID(bucketStart: bucket, deviceID: delta.deviceID)
-            let current = trendByID[pointID]
-            trendByID[pointID] = TrendPoint(
-                date: bucket,
-                deviceID: delta.deviceID,
-                deviceName: updatedDevices[deviceIndex].name,
-                count: (current?.count ?? 0) + delta.count
-            )
-            keys[delta.key, default: 0] += delta.count
-        }
-
-        return StatisticsSnapshot(
-            query: query,
-            revision: result.revision,
-            devices: updatedDevices,
-            trend: Array(trendByID.values),
-            keyCounts: keys.map { KeyCount(key: $0.key, count: $0.value) }
-        )
-    }
-
-    func affectsVisibleContent(in result: FlushResult) -> Bool {
-        guard result.invalidation.affects(query) else { return false }
-        guard result.invalidation.scope == .counts else { return true }
-        let visibleDeviceIDs = Set(devices.map(\.id))
-        return result.deltas.contains { delta in
-            visibleDeviceIDs.contains(delta.deviceID)
-                && (query.deviceID == nil || query.deviceID == delta.deviceID)
-                && query.contains(localDay: delta.localDay)
-                && {
-                    switch query.granularity {
-                    case .minute: query.contains(bucket: delta.minuteBucket)
-                    case .hour: query.contains(bucket: delta.hourBucket)
-                    case .day, .week, .month: true
-                    }
-                }()
-        }
-    }
-
-    private static func date(fromLocalDay value: String, calendar: Calendar) -> Date? {
-        let parts = value.split(separator: "-").compactMap { Int($0) }
-        guard parts.count == 3 else { return nil }
-        return calendar.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))
-    }
-}
-
-typealias StatisticsViewSnapshot = StatisticsSnapshot
-
-struct FlushDelta: Hashable, Sendable {
-    let minuteBucket: Int64
-    let hourBucket: Int64
-    let localDay: String
-    let deviceID: UUID
-    let key: HIDKeyID
-    let count: Int64
-
-    var localMonth: String { String(localDay.prefix(7)) }
-}
-
-struct StatisticsInvalidation: Equatable, Sendable {
-    enum Scope: Equatable, Sendable {
-        case counts
-        case full
-    }
-
-    let revision: Int64
-    let scope: Scope
-    let deviceIDs: Set<UUID>
-    let minuteBuckets: Set<Int64>
-    let hourBuckets: Set<Int64>
-    let localDays: Set<String>
-
-    static func counts(revision: Int64, deltas: [FlushDelta]) -> StatisticsInvalidation {
-        StatisticsInvalidation(
-            revision: revision,
-            scope: .counts,
-            deviceIDs: Set(deltas.map(\.deviceID)),
-            minuteBuckets: Set(deltas.map(\.minuteBucket)),
-            hourBuckets: Set(deltas.map(\.hourBucket)),
-            localDays: Set(deltas.map(\.localDay))
-        )
-    }
-
-    static func full(revision: Int64, deviceIDs: Set<UUID> = []) -> StatisticsInvalidation {
-        StatisticsInvalidation(
-            revision: revision,
-            scope: .full,
-            deviceIDs: deviceIDs,
-            minuteBuckets: [],
-            hourBuckets: [],
-            localDays: []
-        )
-    }
-
-    func affects(_ query: StatisticsQuery) -> Bool {
-        if scope == .full { return true }
-        if let deviceID = query.deviceID, !deviceIDs.contains(deviceID) { return false }
-        switch query.granularity {
-        case .minute:
-            return minuteBuckets.contains { query.contains(bucket: $0) }
-        case .hour:
-            return hourBuckets.contains { query.contains(bucket: $0) }
-        case .day, .week, .month:
-            return localDays.contains { query.contains(localDay: $0) }
-        }
-    }
-}
-
-struct FlushResult: Equatable, Sendable {
-    let revision: Int64
-    let deltas: [FlushDelta]
-    let invalidation: StatisticsInvalidation
-
-    static func full(revision: Int64, deviceIDs: Set<UUID> = []) -> FlushResult {
-        FlushResult(
-            revision: revision,
-            deltas: [],
-            invalidation: .full(revision: revision, deviceIDs: deviceIDs)
-        )
     }
 }
 
@@ -456,10 +282,4 @@ struct DashboardSnapshot: Equatable, Sendable {
     func visibleTodayCounts(hideZeroCount: Bool) -> [DeviceCount] {
         hideZeroCount ? todayByDevice.filter { $0.count > 0 } : todayByDevice
     }
-}
-
-struct RevisionedDashboardSnapshot: Equatable, Sendable {
-    let revision: Int64
-    let localDay: String
-    let snapshot: DashboardSnapshot
 }

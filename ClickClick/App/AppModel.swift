@@ -19,9 +19,6 @@ final class AppModel {
     private var engine: StatisticsEngine?
     private var monitor: CoreHIDInputMonitor?
     private var bootstrapTask: Task<Void, Never>?
-    private var flushTask: Task<Void, Never>?
-    @ObservationIgnored private var dashboardLocalDay = TimeBuckets.localDay(for: Date())
-    @ObservationIgnored private var dashboardRevision: Int64 = 0
     @ObservationIgnored private var dashboardRefreshGeneration: UInt64 = 0
     private let preferences: UserDefaults
 
@@ -84,7 +81,11 @@ final class AppModel {
     }
 
     func clockOrWakeDidChange() async {
-        await flushPendingCounts()
+        do {
+            try await engine?.flush()
+        } catch {
+            report(error)
+        }
         await refreshDashboard()
         statisticsViewModel?.invalidateAndReload()
     }
@@ -98,9 +99,9 @@ final class AppModel {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty, let engine else { return }
         do {
-            let result = try await engine.renameDevice(id: id, name: trimmedName)
-            statisticsViewModel?.consume(result)
+            try await engine.renameDevice(id: id, name: trimmedName)
             await refreshDashboard()
+            statisticsViewModel?.dataDidChange()
         } catch {
             report(error)
         }
@@ -109,12 +110,10 @@ final class AppModel {
     func hideDevice(_ id: UUID, hidden: Bool) async {
         guard let engine else { return }
         do {
-            let result = try await engine.setDeviceHidden(id: id, hidden: hidden)
+            try await engine.setDeviceHidden(id: id, hidden: hidden)
             let selectionChanged = hidden && clearStatisticsSelection(if: id)
-            if !selectionChanged {
-                statisticsViewModel?.consume(result)
-            }
             await refreshDashboard()
+            if !selectionChanged { statisticsViewModel?.dataDidChange() }
         } catch {
             report(error)
         }
@@ -123,12 +122,10 @@ final class AppModel {
     func mergeDevice(_ source: UUID, into target: UUID) async {
         guard let engine else { return }
         do {
-            let result = try await engine.mergeDevice(source: source, target: target)
+            try await engine.mergeDevice(source: source, target: target)
             let selectionChanged = clearStatisticsSelection()
-            if !selectionChanged {
-                statisticsViewModel?.consume(result)
-            }
             await refreshDashboard()
+            if !selectionChanged { statisticsViewModel?.dataDidChange() }
         } catch {
             report(error)
         }
@@ -137,13 +134,11 @@ final class AppModel {
     func deleteDevice(_ id: UUID) async {
         guard let engine else { return }
         do {
-            let result = try await engine.deleteDevice(id: id)
+            try await engine.deleteDevice(id: id)
             await monitor?.deviceWasDeleted(id)
             let selectionChanged = clearStatisticsSelection(if: id)
-            if !selectionChanged {
-                statisticsViewModel?.consume(result)
-            }
             await refreshDashboard()
+            if !selectionChanged { statisticsViewModel?.dataDidChange() }
         } catch {
             report(error)
         }
@@ -152,12 +147,10 @@ final class AppModel {
     func clearAllCounts() async {
         guard let engine else { return }
         do {
-            let result = try await engine.clearAllCounts()
+            try await engine.clearAllCounts()
             let selectionChanged = hideZeroCountDevices && clearStatisticsSelection()
-            if !selectionChanged {
-                statisticsViewModel?.consume(result)
-            }
             await refreshDashboard()
+            if !selectionChanged { statisticsViewModel?.dataDidChange() }
         } catch {
             report(error)
         }
@@ -166,12 +159,10 @@ final class AppModel {
     func clearCounts(for id: UUID) async {
         guard let engine else { return }
         do {
-            let result = try await engine.clearCounts(deviceID: id)
+            try await engine.clearCounts(deviceID: id)
             let selectionChanged = hideZeroCountDevices && clearStatisticsSelection(if: id)
-            if !selectionChanged {
-                statisticsViewModel?.consume(result)
-            }
             await refreshDashboard()
+            if !selectionChanged { statisticsViewModel?.dataDidChange() }
         } catch {
             report(error)
         }
@@ -204,13 +195,9 @@ final class AppModel {
 
     func flushForTermination() async {
         bootstrapTask?.cancel()
-        flushTask?.cancel()
         await monitor?.stop()
         do {
-            if let result = try await engine?.flush() {
-                statisticsViewModel?.consume(result)
-                _ = applyToDashboard(result)
-            }
+            try await engine?.flush()
         } catch {
             report(error)
         }
@@ -236,16 +223,16 @@ final class AppModel {
             await monitor.setStateHandler { [weak self] state in
                 await self?.monitorStateDidChange(state)
             }
-
-            if let maintenance = try await engine.performMaintenance() {
-                statisticsViewModel?.consume(maintenance)
+            await engine.setFlushHandler { [weak self] error in
+                await self?.flushDidFinish(error)
             }
+
+            try await engine.performMaintenance()
             await refreshDashboard()
 
             // Input listening starts only after migration and its validation have
             // succeeded. A migration error leaves the database and backup intact.
             permissionState = await monitor.refreshPermission()
-            startFlushLoop()
         } catch is CancellationError {
             return
         } catch {
@@ -254,100 +241,13 @@ final class AppModel {
         }
     }
 
-    private func startFlushLoop() {
-        guard flushTask == nil else { return }
-        flushTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    try await Task.sleep(for: .seconds(2))
-                } catch {
-                    return
-                }
-                guard let self else { return }
-                await self.flushPendingCounts()
-            }
-        }
-    }
-
-    private func flushPendingCounts() async {
-        guard let engine else { return }
-        do {
-            guard let result = try await engine.flush() else { return }
-            let newlyVisibleDevices = applyToDashboard(result)
-            statisticsViewModel?.consume(result)
-            if hideZeroCountDevices,
-               statisticsViewModel?.selectedDeviceID != nil,
-               !newlyVisibleDevices.isEmpty {
-                // A delta for another device can be irrelevant to a filtered
-                // chart while still changing the device picker's membership.
-                statisticsViewModel?.invalidateAndReload()
-            }
-            clearError()
-        } catch {
+    private func flushDidFinish(_ error: Error?) async {
+        if let error {
             report(error)
+            return
         }
-    }
-
-    @discardableResult
-    private func applyToDashboard(_ result: FlushResult) -> Set<UUID> {
-        guard result.revision > dashboardRevision else { return [] }
-        guard result.invalidation.scope == .counts else {
-            Task { [weak self] in await self?.refreshDashboard() }
-            return []
-        }
-        guard !result.deltas.isEmpty else { return [] }
-        guard result.revision == dashboardRevision + 1 else {
-            Task { [weak self] in await self?.refreshDashboard() }
-            return []
-        }
-        let today = TimeBuckets.localDay(for: Date())
-        guard dashboardLocalDay == today else {
-            Task { [weak self] in await self?.refreshDashboard() }
-            return []
-        }
-        var totalByDevice: [UUID: Int64] = [:]
-        var todayByDevice: [UUID: Int64] = [:]
-        for delta in result.deltas {
-            totalByDevice[delta.deviceID, default: 0] += delta.count
-            if delta.localDay == today {
-                todayByDevice[delta.deviceID, default: 0] += delta.count
-            }
-        }
-
-        let knownDeviceIDs = Set(dashboard.devices.map(\.id))
-        guard Set(totalByDevice.keys).isSubset(of: knownDeviceIDs) else {
-            Task { [weak self] in await self?.refreshDashboard() }
-            return []
-        }
-
-        var updated = dashboard
-        var newlyVisibleDevices: Set<UUID> = []
-        for index in updated.devices.indices {
-            let deviceID = updated.devices[index].id
-            let increment = totalByDevice[deviceID, default: 0]
-            if increment > 0,
-               updated.devices[index].totalCount == 0,
-               !updated.devices[index].isHidden {
-                newlyVisibleDevices.insert(deviceID)
-            }
-            updated.devices[index].totalCount += increment
-        }
-
-        let devicesByID = Dictionary(uniqueKeysWithValues: updated.devices.map { ($0.id, $0) })
-        var currentToday = Dictionary(uniqueKeysWithValues: updated.todayByDevice.map { ($0.deviceID, $0.count) })
-        for (deviceID, count) in todayByDevice where devicesByID[deviceID]?.isHidden == false {
-            currentToday[deviceID, default: 0] += count
-        }
-        updated.todayByDevice = currentToday.compactMap { deviceID, count in
-            guard let device = devicesByID[deviceID], !device.isHidden else { return nil }
-            return DeviceCount(deviceID: deviceID, deviceName: device.name, count: count)
-        }.sorted {
-            $0.count == $1.count ? $0.deviceName < $1.deviceName : $0.count > $1.count
-        }
-        updated.todayTotal = updated.todayByDevice.reduce(0) { $0 + $1.count }
-        dashboardRevision = result.revision
-        dashboard = updated
-        return newlyVisibleDevices
+        await refreshDashboard()
+        statisticsViewModel?.dataDidChange()
     }
 
     private func deviceDirectoryDidChange() async {
@@ -365,17 +265,8 @@ final class AppModel {
         dashboardRefreshGeneration &+= 1
         let requestGeneration = dashboardRefreshGeneration
         do {
-            let read = try await engine.dashboard()
+            let updated = try await engine.dashboard()
             guard requestGeneration == dashboardRefreshGeneration else { return }
-            guard read.revision >= dashboardRevision else { return }
-            let today = TimeBuckets.localDay(for: Date())
-            guard read.localDay == today else {
-                Task { [weak self] in await self?.refreshDashboard() }
-                return
-            }
-            dashboardRevision = read.revision
-            let updated = read.snapshot
-            dashboardLocalDay = read.localDay
             if dashboard != updated {
                 dashboard = updated
             }
