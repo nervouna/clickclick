@@ -272,10 +272,12 @@ private struct TrendChartView: View {
                         y: .value("按键", point.count)
                     )
                     .interpolationMethod(.monotone)
-                    PointMark(
-                        x: .value("时间", point.date),
-                        y: .value("按键", point.count)
-                    )
+                    if point.count > 0 {
+                        PointMark(
+                            x: .value("时间", point.date),
+                            y: .value("按键", point.count)
+                        )
+                    }
                 }
                 .chartXScale(domain: domain)
                 .frame(height: 280)
