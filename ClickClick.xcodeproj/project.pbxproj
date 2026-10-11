@@ -21,7 +21,6 @@
 		640D47F4CD7B3E36CAA71BA5 /* StatisticsEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = D59DD0F5C38CC11840760514 /* StatisticsEngine.swift */; };
 		73BF7DF5E4524AB674666F3B /* StatisticsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CCB7DF29B289AD56EE2D2E4 /* StatisticsViewModel.swift */; };
 		770AD38FD0B533242FA29356 /* DevicesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD9DA45CE478AB5E881D0E98 /* DevicesView.swift */; };
-		9D3CDC4C8CEF124B3F54BA89 /* StatisticsPerformanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22AA34BA8208B78889E5824E /* StatisticsPerformanceTests.swift */; };
 		B3E4A9EC323BF4041768BA8B /* CountingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC5F3BD730169E6236EFBBB8 /* CountingTests.swift */; };
 		B53F8F635DC44502FC9D18A5 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D088D17D885D8C1C8391BEBE /* SettingsView.swift */; };
 		B6503F965B02776288C5159B /* CoreHIDInputMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = C17A261BFFC7D188679A6D61 /* CoreHIDInputMonitor.swift */; };
@@ -48,7 +47,6 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		22AA34BA8208B78889E5824E /* StatisticsPerformanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatisticsPerformanceTests.swift; sourceTree = "<group>"; };
 		2F61079CCD52BC0E11D95D1B /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		306F5A9EC1CF00621210FF74 /* SQLiteStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SQLiteStore.swift; sourceTree = "<group>"; };
 		362BC7CF98066C5A9FE3E8E5 /* MenuBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarView.swift; sourceTree = "<group>"; };
@@ -198,7 +196,6 @@
 				C3B5759110426A0644F4F44B /* SQLiteStoreMigrationTests.swift */,
 				C6150EC88F620D3208D73C45 /* StatisticsConcurrencyModelTests.swift */,
 				803EE7876F487D71085A82CF /* StatisticsEngineTests.swift */,
-				22AA34BA8208B78889E5824E /* StatisticsPerformanceTests.swift */,
 			);
 			path = ClickClickTests;
 			sourceTree = "<group>";
@@ -312,7 +309,6 @@
 				CBACB23AEFCDE8B68EF9BD45 /* SQLiteStoreMigrationTests.swift in Sources */,
 				52E6E5B5778ED1F5AAB98494 /* StatisticsConcurrencyModelTests.swift in Sources */,
 				4DEF81E3A3043D9CECC68635 /* StatisticsEngineTests.swift in Sources */,
-				9D3CDC4C8CEF124B3F54BA89 /* StatisticsPerformanceTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

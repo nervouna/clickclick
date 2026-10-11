@@ -24,11 +24,6 @@ struct CountIncrement: Hashable, Sendable {
     var count: Int64
 }
 
-struct CountApplyOutcome: Equatable, Sendable {
-    let revision: Int64
-    let reconciledCanonicalState: Bool
-}
-
 struct DailyTrendRow: Equatable, Sendable {
     let localDay: String
     let deviceID: UUID
@@ -36,38 +31,28 @@ struct DailyTrendRow: Equatable, Sendable {
     let count: Int64
 }
 
-/// SQLite v2 store. Writer and reader actors own separate WAL connections so a
+/// SQLite store. Writer and reader actors own separate WAL connections so a
 /// historical query cannot serialize input persistence behind itself.
 final class SQLiteStore: @unchecked Sendable {
-    static let schemaVersion = 2
-    static let backupName = "clickclick-v1-backup.sqlite"
+    static let schemaVersion = 3
 
     private var database: OpaquePointer?
     private let databaseURL: URL
-    private let isReadOnly: Bool
-    private let backupRemover: (@Sendable (URL) throws -> Void)?
     private let transientDestructor = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-    private let progressLock = NSLock()
-    private var progressCancellation: (() -> Bool)?
 
-    init(
-        url: URL,
-        backupRemover: (@Sendable (URL) throws -> Void)? = nil
-    ) throws {
+    init(url: URL) throws {
         databaseURL = url
-        isReadOnly = false
-        self.backupRemover = backupRemover
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
         try open(flags: SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX)
         do {
+            // Reject unsupported databases before any pragma touches the file.
+            try migrateIfNeeded()
             try run("PRAGMA journal_mode = WAL;")
             try run("PRAGMA foreign_keys = ON;")
             try run("PRAGMA synchronous = NORMAL;")
-            try migrateIfNeeded()
-            try rebuildDerivedTablesIfCanonicalDataDrifted()
         } catch {
             if let database { sqlite3_close(database) }
             database = nil
@@ -77,8 +62,6 @@ final class SQLiteStore: @unchecked Sendable {
 
     init(readOnlyURL url: URL) throws {
         databaseURL = url
-        isReadOnly = true
-        backupRemover = nil
         try open(flags: SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX)
         do {
             try run("PRAGMA foreign_keys = ON;")
@@ -91,35 +74,13 @@ final class SQLiteStore: @unchecked Sendable {
     }
 
     deinit {
-        if let database {
-            sqlite3_progress_handler(database, 0, nil, nil)
-            sqlite3_close(database)
-        }
+        if let database { sqlite3_close(database) }
     }
 
     // MARK: Cancellation and consistent reads
 
-    func installProgressHandler(every operations: Int32, shouldCancel: @escaping () -> Bool) {
-        progressLock.withLock { progressCancellation = shouldCancel }
-        sqlite3_progress_handler(
-            database,
-            max(1, operations),
-            sqliteStoreV2ProgressCallback,
-            Unmanaged.passUnretained(self).toOpaque()
-        )
-    }
-
-    func clearProgressHandler() {
-        sqlite3_progress_handler(database, 0, nil, nil)
-        progressLock.withLock { progressCancellation = nil }
-    }
-
     func interrupt() {
         sqlite3_interrupt(database)
-    }
-
-    fileprivate func shouldCancelProgress() -> Bool {
-        progressLock.withLock { progressCancellation?() ?? false }
     }
 
     func readTransaction<T>(_ work: () throws -> T) throws -> T {
@@ -205,23 +166,14 @@ final class SQLiteStore: @unchecked Sendable {
     /// revision in one transaction.
     @discardableResult
     func apply(_ increments: [CountIncrement]) throws -> Int64 {
-        try applyWithOutcome(increments).revision
-    }
-
-    func applyWithOutcome(_ increments: [CountIncrement]) throws -> CountApplyOutcome {
         let valid = increments.filter { $0.key.isCountable && $0.count > 0 }
-        guard !valid.isEmpty else {
-            return CountApplyOutcome(
-                revision: try revision(),
-                reconciledCanonicalState: false
-            )
-        }
+        guard !valid.isEmpty else { return try revision() }
 
-        var minuteCounts: [V2BucketDevice: Int64] = [:]
-        var hourCounts: [V2BucketDevice: Int64] = [:]
-        var dayCounts: [V2DayDevice: Int64] = [:]
-        var dailyKeys: [V2DayDeviceKey: Int64] = [:]
-        var monthlyKeys: [V2MonthDeviceKey: Int64] = [:]
+        var minuteCounts: [BucketDevice: Int64] = [:]
+        var hourCounts: [BucketDevice: Int64] = [:]
+        var dayCounts: [DayDevice: Int64] = [:]
+        var dailyKeys: [DayDeviceKey: Int64] = [:]
+        var monthlyKeys: [MonthDeviceKey: Int64] = [:]
         var totals: [UUID: Int64] = [:]
         for increment in valid {
             minuteCounts[.init(bucket: increment.minute, deviceID: increment.deviceID), default: 0] += increment.count
@@ -238,9 +190,7 @@ final class SQLiteStore: @unchecked Sendable {
             totals[increment.deviceID, default: 0] += increment.count
         }
 
-        let totalDelta = valid.reduce(Int64(0)) { $0 + $1.count }
         return try writeTransaction {
-            let canonicalState = try prepareCanonicalStateForWrite()
             try batch(
                 """
                 INSERT INTO minute_device_counts (bucket_start, device_id, count) VALUES (?, ?, ?)
@@ -295,11 +245,7 @@ final class SQLiteStore: @unchecked Sendable {
                 """,
                 rows: totals.map { [.text($0.key.uuidString), .int($0.value)] }
             )
-            try setCanonicalSignature(total: canonicalState.total + totalDelta)
-            return CountApplyOutcome(
-                revision: try bumpRevision(),
-                reconciledCanonicalState: canonicalState.reconciled
-            )
+            return try bumpRevision()
         }
     }
 
@@ -383,7 +329,7 @@ final class SQLiteStore: @unchecked Sendable {
             FROM \(table) c JOIN devices d ON d.id = c.device_id
             WHERE c.bucket_start >= ? AND c.bucket_start < ? AND d.is_hidden = 0
             """
-        var bindings: [V2Binding] = [
+        var bindings: [SQLBinding] = [
             .int(Int64(from.timeIntervalSince1970)),
             .int(Int64(to.timeIntervalSince1970))
         ]
@@ -404,7 +350,7 @@ final class SQLiteStore: @unchecked Sendable {
             FROM daily_device_counts c JOIN devices d ON d.id = c.device_id
             WHERE c.local_day >= ? AND c.local_day <= ? AND d.is_hidden = 0
             """
-        var bindings: [V2Binding] = [.text(fromDay), .text(toDay)]
+        var bindings: [SQLBinding] = [.text(fromDay), .text(toDay)]
         if let deviceID {
             sql += " AND d.id = ?"
             bindings.append(.text(deviceID.uuidString))
@@ -422,7 +368,7 @@ final class SQLiteStore: @unchecked Sendable {
     }
 
     /// Complete months are read from the monthly key rollup. Only an
-    /// incomplete first/last month touches the canonical daily-key table.
+    /// incomplete first/last month reads the daily key table.
     func keyCounts(fromDay: String, toDay: String, deviceID: UUID?) throws -> [KeyCount] {
         guard fromDay <= toDay else { return [] }
         let completeMonths = Self.completeMonths(fromDay: fromDay, toDay: toDay)
@@ -435,7 +381,7 @@ final class SQLiteStore: @unchecked Sendable {
                 JOIN devices d ON d.id = c.device_id
                 WHERE c.local_month >= ? AND c.local_month <= ? AND d.is_hidden = 0
                 """
-            var bindings: [V2Binding] = [.text(first), .text(last)]
+            var bindings: [SQLBinding] = [.text(first), .text(last)]
             if let deviceID {
                 sql += " AND d.id = ?"
                 bindings.append(.text(deviceID.uuidString))
@@ -458,7 +404,7 @@ final class SQLiteStore: @unchecked Sendable {
                 JOIN devices d ON d.id = c.device_id
                 WHERE c.local_day >= ? AND c.local_day <= ? AND d.is_hidden = 0
                 """
-            var bindings: [V2Binding] = [.text(partialRange.from), .text(partialRange.to)]
+            var bindings: [SQLBinding] = [.text(partialRange.from), .text(partialRange.to)]
             if let deviceID {
                 sql += " AND d.id = ?"
                 bindings.append(.text(deviceID.uuidString))
@@ -479,11 +425,8 @@ final class SQLiteStore: @unchecked Sendable {
 
     @discardableResult
     func mergeDevice(source: UUID, target: UUID) throws -> Int64 {
-        return try writeTransaction {
-            let canonicalState = try prepareCanonicalStateForWrite()
-            guard source != target else {
-                return canonicalState.reconciled ? try bumpRevision() : try revision()
-            }
+        try writeTransaction {
+            guard source != target else { return try revision() }
             for table in ["minute_device_counts", "hourly_device_counts"] {
                 try prepared(
                     """
@@ -532,78 +475,44 @@ final class SQLiteStore: @unchecked Sendable {
             )
             try deleteDeviceRows(id: source)
             try prepared("DELETE FROM devices WHERE id = ?", bindings: [.text(source.uuidString)])
-            // Canonical-table triggers mark the signature dirty during the
-            // merge. All six aggregates are already synchronized here, so only
-            // recompute the signature instead of rebuilding them.
-            try refreshCanonicalSignature()
             return try bumpRevision()
         }
     }
 
     @discardableResult
     func deleteDevice(id: UUID) throws -> Int64 {
-        return try writeTransaction {
-            let canonicalState = try prepareCanonicalStateForWrite()
+        try writeTransaction {
             let exists = try intValue(
                 "SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)",
                 bindings: [.text(id.uuidString)]
             ) == 1
-            let publishedRevision: Int64
-            if exists {
-                try deleteDeviceRows(id: id)
-                try prepared("DELETE FROM devices WHERE id = ?", bindings: [.text(id.uuidString)])
-                try refreshCanonicalSignature()
-                publishedRevision = try bumpRevision()
-            } else {
-                publishedRevision = canonicalState.reconciled ? try bumpRevision() : try revision()
-            }
-            try removeV1BackupBeforeCommit()
-            return publishedRevision
+            guard exists else { return try revision() }
+            try deleteDeviceRows(id: id)
+            try prepared("DELETE FROM devices WHERE id = ?", bindings: [.text(id.uuidString)])
+            return try bumpRevision()
         }
     }
 
     @discardableResult
     func clearAllCounts() throws -> Int64 {
-        return try writeTransaction {
-            let hasCounts = try hasAnyCounts(deviceID: nil)
-            let storedSignature = try textValue(
-                "SELECT canonical_signature FROM statistics_state WHERE singleton = 1",
-                bindings: []
-            ) ?? ""
-            let stateChanged = hasCounts || storedSignature != "v1:0"
-            let publishedRevision: Int64
-            if stateChanged {
-                for table in Self.countTables { try run("DELETE FROM \(table);") }
-                try setCanonicalSignature(total: 0)
-                publishedRevision = try bumpRevision()
-            } else {
-                publishedRevision = try revision()
-            }
-            try removeV1BackupBeforeCommit()
-            return publishedRevision
+        try writeTransaction {
+            guard try hasAnyCounts(deviceID: nil) else { return try revision() }
+            for table in Self.countTables { try run("DELETE FROM \(table);") }
+            return try bumpRevision()
         }
     }
 
     @discardableResult
     func clearCounts(deviceID: UUID) throws -> Int64 {
-        return try writeTransaction {
-            let canonicalState = try prepareCanonicalStateForWrite()
-            let hasCounts = try hasAnyCounts(deviceID: deviceID)
-            let publishedRevision: Int64
-            if hasCounts {
-                for table in Self.countTables {
-                    try prepared(
-                        "DELETE FROM \(table) WHERE device_id = ?",
-                        bindings: [.text(deviceID.uuidString)]
-                    )
-                }
-                try refreshCanonicalSignature()
-                publishedRevision = try bumpRevision()
-            } else {
-                publishedRevision = canonicalState.reconciled ? try bumpRevision() : try revision()
+        try writeTransaction {
+            guard try hasAnyCounts(deviceID: deviceID) else { return try revision() }
+            for table in Self.countTables {
+                try prepared(
+                    "DELETE FROM \(table) WHERE device_id = ?",
+                    bindings: [.text(deviceID.uuidString)]
+                )
             }
-            try removeV1BackupBeforeCommit()
-            return publishedRevision
+            return try bumpRevision()
         }
     }
 
@@ -613,7 +522,7 @@ final class SQLiteStore: @unchecked Sendable {
             .map { "SELECT 1 FROM \($0)\(predicate)" }
             .joined(separator: " UNION ALL ")
         let bindings = deviceID.map { id in
-            Array(repeating: V2Binding.text(id.uuidString), count: Self.countTables.count)
+            Array(repeating: SQLBinding.text(id.uuidString), count: Self.countTables.count)
         } ?? []
         return try intValue(
             "SELECT EXISTS(SELECT 1 FROM (\(union)) LIMIT 1)",
@@ -628,46 +537,37 @@ final class SQLiteStore: @unchecked Sendable {
         try prepared("DELETE FROM device_aliases WHERE device_id = ?", bindings: [.text(id.uuidString)])
     }
 
-    // MARK: Schema v2 migration
+    // MARK: Schema migration
 
     private func migrateIfNeeded() throws {
-        let hasLegacySchema = try tableExists("devices")
         let version = Int(try intValue("PRAGMA user_version") ?? 0)
 
-        if !hasLegacySchema {
+        guard try tableExists("devices") else {
             try writeTransaction {
-                try createSchemaV2()
-                try ensureStatisticsState()
+                try createSchema()
+                try run("INSERT INTO statistics_state (singleton, revision) VALUES (1, 0);")
                 try run("PRAGMA user_version = \(Self.schemaVersion);")
             }
             return
         }
 
-        guard version < Self.schemaVersion else {
-            try createSchemaV2()
-            try ensureStatisticsState()
-            return
+        guard version >= 2 else {
+            throw StoreError.open("不支持旧版本数据库（user_version \(version)）")
         }
+        guard version == 2 else { return }
 
-        // The online backup reads the source connection, including its WAL,
-        // before the first migration mutation occurs.
-        try createV1BackupIfNeeded()
-        do {
-            try writeTransaction {
-                try repairInvalidKeyCountsInCurrentTransaction()
-                try createSchemaV2()
-                try ensureStatisticsState()
-                try rebuildDerivedTablesInCurrentTransaction()
-                try validateDerivedTables()
-                try refreshCanonicalSignature()
-                try run("PRAGMA user_version = \(Self.schemaVersion);")
+        try writeTransaction {
+            for trigger in ["insert", "update", "delete"] {
+                try run("DROP TRIGGER IF EXISTS mark_statistics_dirty_after_daily_\(trigger);")
             }
-        } catch {
-            throw StoreError.execute("迁移已回滚：\(error.localizedDescription)")
+            try run("ALTER TABLE statistics_state DROP COLUMN canonical_signature;")
+            try run("PRAGMA user_version = \(Self.schemaVersion);")
         }
+        let backupURL = databaseURL.deletingLastPathComponent().appending(path: "clickclick-v1-backup.sqlite")
+        try? FileManager.default.removeItem(at: backupURL)
     }
 
-    private func createSchemaV2() throws {
+    private func createSchema() throws {
         try run("""
         CREATE TABLE IF NOT EXISTS devices (
             id TEXT PRIMARY KEY,
@@ -726,21 +626,8 @@ final class SQLiteStore: @unchecked Sendable {
         );
         CREATE TABLE IF NOT EXISTS statistics_state (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-            revision INTEGER NOT NULL,
-            canonical_signature TEXT NOT NULL
+            revision INTEGER NOT NULL
         );
-        CREATE TRIGGER IF NOT EXISTS mark_statistics_dirty_after_daily_insert
-        AFTER INSERT ON daily_device_key_counts BEGIN
-            UPDATE statistics_state SET canonical_signature = 'dirty' WHERE singleton = 1;
-        END;
-        CREATE TRIGGER IF NOT EXISTS mark_statistics_dirty_after_daily_update
-        AFTER UPDATE ON daily_device_key_counts BEGIN
-            UPDATE statistics_state SET canonical_signature = 'dirty' WHERE singleton = 1;
-        END;
-        CREATE TRIGGER IF NOT EXISTS mark_statistics_dirty_after_daily_delete
-        AFTER DELETE ON daily_device_key_counts BEGIN
-            UPDATE statistics_state SET canonical_signature = 'dirty' WHERE singleton = 1;
-        END;
         CREATE INDEX IF NOT EXISTS idx_minute_device ON minute_device_counts(device_id, bucket_start);
         CREATE INDEX IF NOT EXISTS idx_hourly_device ON hourly_device_counts(device_id, bucket_start);
         CREATE INDEX IF NOT EXISTS idx_daily_key_device ON daily_device_key_counts(device_id, local_day);
@@ -749,337 +636,11 @@ final class SQLiteStore: @unchecked Sendable {
         """)
     }
 
-    private func ensureStatisticsState() throws {
-        try run(
-            "INSERT OR IGNORE INTO statistics_state (singleton, revision, canonical_signature) VALUES (1, 0, 'v1:0');"
-        )
-    }
-
-    private func rebuildDerivedTablesIfCanonicalDataDrifted() throws {
-        guard !isReadOnly else { return }
-        let expected = try canonicalSignatureFromSource()
-        let stored = try textValue(
-            "SELECT canonical_signature FROM statistics_state WHERE singleton = 1",
-            bindings: []
-        ) ?? ""
-        guard stored != expected else { return }
-        try writeTransaction {
-            try rebuildDerivedTablesInCurrentTransaction()
-            try validateDerivedTables()
-            try prepared(
-                "UPDATE statistics_state SET canonical_signature = ?, revision = revision + 1 WHERE singleton = 1",
-                bindings: [.text(expected)]
-            )
-        }
-    }
-
-    private func rebuildDerivedTablesInCurrentTransaction() throws {
-        try run("DELETE FROM daily_device_counts;")
-        try run("DELETE FROM monthly_device_key_counts;")
-        try run("DELETE FROM device_total_counts;")
-        try run("""
-            INSERT INTO daily_device_counts (local_day, device_id, count)
-            SELECT local_day, device_id, SUM(count)
-            FROM daily_device_key_counts
-            GROUP BY local_day, device_id;
-            INSERT INTO monthly_device_key_counts (local_month, device_id, usage_page, usage, count)
-            SELECT substr(local_day, 1, 7), device_id, usage_page, usage, SUM(count)
-            FROM daily_device_key_counts
-            GROUP BY substr(local_day, 1, 7), device_id, usage_page, usage;
-            INSERT INTO device_total_counts (device_id, count)
-            SELECT device_id, SUM(count)
-            FROM daily_device_key_counts
-            GROUP BY device_id;
-            """)
-    }
-
-    private func validateDerivedTables() throws {
-        let canonical = try intValue("SELECT COALESCE(SUM(count), 0) FROM daily_device_key_counts") ?? 0
-        let daily = try intValue("SELECT COALESCE(SUM(count), 0) FROM daily_device_counts") ?? 0
-        let monthly = try intValue("SELECT COALESCE(SUM(count), 0) FROM monthly_device_key_counts") ?? 0
-        let totals = try intValue("SELECT COALESCE(SUM(count), 0) FROM device_total_counts") ?? 0
-        guard canonical == daily, canonical == monthly, canonical == totals else {
-            throw StoreError.execute("全局派生聚合校验不一致")
-        }
-
-        let mismatchCount = try intValue(
-            """
-            SELECT COUNT(*) FROM (
-                SELECT d.id,
-                       COALESCE(k.total, 0) canonical_total,
-                       COALESCE(dd.total, 0) daily_total,
-                       COALESCE(mm.total, 0) monthly_total,
-                       COALESCE(dt.count, 0) stored_total
-                FROM devices d
-                LEFT JOIN (
-                    SELECT device_id, SUM(count) total FROM daily_device_key_counts GROUP BY device_id
-                ) k ON k.device_id = d.id
-                LEFT JOIN (
-                    SELECT device_id, SUM(count) total FROM daily_device_counts GROUP BY device_id
-                ) dd ON dd.device_id = d.id
-                LEFT JOIN (
-                    SELECT device_id, SUM(count) total FROM monthly_device_key_counts GROUP BY device_id
-                ) mm ON mm.device_id = d.id
-                LEFT JOIN device_total_counts dt ON dt.device_id = d.id
-            ) WHERE canonical_total <> daily_total
-                   OR canonical_total <> monthly_total
-                   OR canonical_total <> stored_total
-            """
-        ) ?? 0
-        guard mismatchCount == 0 else {
-            throw StoreError.execute("逐设备派生聚合校验不一致")
-        }
-    }
-
-    private func createV1BackupIfNeeded() throws {
-        let backupURL = databaseURL.deletingLastPathComponent().appending(path: Self.backupName)
-        if FileManager.default.fileExists(atPath: backupURL.path) {
-            guard try isValidV1Backup(at: backupURL) else {
-                throw StoreError.execute("现有 v1 备份不完整，已停止升级并保留该文件")
-            }
-            return
-        }
-
-        let temporaryURL = backupURL.deletingLastPathComponent().appending(
-            path: ".\(Self.backupName).\(UUID().uuidString).partial"
-        )
-        defer { try? FileManager.default.removeItem(at: temporaryURL) }
-
-        var destination: OpaquePointer?
-        guard sqlite3_open_v2(
-            temporaryURL.path,
-            &destination,
-            SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,
-            nil
-        ) == SQLITE_OK else {
-            let message = Self.message(from: destination)
-            if let destination { sqlite3_close(destination) }
-            throw StoreError.execute("无法创建 v1 备份：\(message)")
-        }
-        defer {
-            if let destination { sqlite3_close(destination) }
-        }
-
-        guard let backup = sqlite3_backup_init(destination, "main", database, "main") else {
-            throw StoreError.execute("无法初始化 v1 备份：\(Self.message(from: destination))")
-        }
-        let stepResult = sqlite3_backup_step(backup, -1)
-        let finishResult = sqlite3_backup_finish(backup)
-        guard stepResult == SQLITE_DONE, finishResult == SQLITE_OK else {
-            throw StoreError.execute("v1 备份写入失败：\(Self.message(from: destination))")
-        }
-
-        // The writer enables WAL before migration. A standalone recovery file
-        // must not depend on a sibling `-wal` file that will not be retained
-        // with the backup, so normalize the destination back to DELETE mode.
-        var journalError: UnsafeMutablePointer<CChar>?
-        let journalResult = sqlite3_exec(
-            destination,
-            "PRAGMA journal_mode = DELETE;",
-            nil,
-            nil,
-            &journalError
-        )
-        guard journalResult == SQLITE_OK else {
-            let message = journalError.map { String(cString: $0) } ?? Self.message(from: destination)
-            sqlite3_free(journalError)
-            throw StoreError.execute("v1 备份收尾失败：\(message)")
-        }
-
-        sqlite3_close(destination)
-        destination = nil
-        guard try isValidV1Backup(at: temporaryURL) else {
-            throw StoreError.execute("v1 备份完整性检查失败")
-        }
-        do {
-            try FileManager.default.moveItem(at: temporaryURL, to: backupURL)
-        } catch {
-            throw StoreError.execute("无法保存 v1 备份：\(error.localizedDescription)")
-        }
-    }
-
-    private func removeV1BackupBeforeCommit() throws {
-        let backupURL = databaseURL.deletingLastPathComponent().appending(path: Self.backupName)
-        do {
-            if let backupRemover {
-                try backupRemover(backupURL)
-            } else {
-                try FileManager.default.removeItem(at: backupURL)
-            }
-        } catch let error as CocoaError where error.code == .fileNoSuchFile {
-            // A missing file is already the desired state, but still verify
-            // the fixed recovery path in case another process raced the call.
-        } catch {
-            throw StoreError.execute("无法移除包含历史计数的 v1 备份：\(error.localizedDescription)")
-        }
-        guard !FileManager.default.fileExists(atPath: backupURL.path) else {
-            throw StoreError.execute("无法确认包含历史计数的 v1 备份已移除")
-        }
-    }
-
-    private func isValidV1Backup(at url: URL) throws -> Bool {
-        var backupDatabase: OpaquePointer?
-        guard sqlite3_open_v2(
-            url.path,
-            &backupDatabase,
-            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
-            nil
-        ) == SQLITE_OK else {
-            if let backupDatabase { sqlite3_close(backupDatabase) }
-            return false
-        }
-        defer { sqlite3_close(backupDatabase) }
-
-        func backupText(_ sql: String) throws -> String? {
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(backupDatabase, sql, -1, &statement, nil) == SQLITE_OK else {
-                throw StoreError.execute("无法检查 v1 备份：\(Self.message(from: backupDatabase))")
-            }
-            defer { sqlite3_finalize(statement) }
-            guard sqlite3_step(statement) == SQLITE_ROW,
-                  let value = sqlite3_column_text(statement, 0) else { return nil }
-            return String(cString: value)
-        }
-
-        let quickCheck = try backupText("PRAGMA quick_check;")
-        let hasCanonicalTable = try backupText(
-            "SELECT CAST(EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'daily_device_key_counts') AS TEXT);"
-        )
-        return quickCheck == "ok" && hasCanonicalTable == "1"
-    }
-
-    // MARK: Legacy invalid-key repair
-
-    private func repairInvalidKeyCountsInCurrentTransaction() throws {
-        let invalid = try rows(
-            """
-            SELECT local_day, device_id, SUM(count)
-            FROM daily_device_key_counts
-            WHERE (usage_page = 7 AND usage BETWEEN 0 AND 3)
-               OR (usage_page = 12 AND usage = 0)
-            GROUP BY local_day, device_id
-            """
-        )
-        for row in invalid {
-            guard let interval = localDayInterval(row.text(0)) else { continue }
-            try repairAggregate(
-                table: "minute_device_counts",
-                deviceID: row.text(1),
-                interval: interval,
-                invalidCount: row.int(2)
-            )
-            try repairAggregate(
-                table: "hourly_device_counts",
-                deviceID: row.text(1),
-                interval: interval,
-                invalidCount: row.int(2)
-            )
-        }
-        try run("""
-            DELETE FROM daily_device_key_counts
-            WHERE (usage_page = 7 AND usage BETWEEN 0 AND 3)
-               OR (usage_page = 12 AND usage = 0);
-            """)
-    }
-
-    private func repairAggregate(
-        table: String,
-        deviceID: String,
-        interval: DateInterval,
-        invalidCount: Int64
-    ) throws {
-        let source = try rows(
-            "SELECT bucket_start, count FROM \(table) WHERE device_id = ? AND bucket_start >= ? AND bucket_start < ? ORDER BY bucket_start",
-            bindings: [
-                .text(deviceID),
-                .int(Int64(interval.start.timeIntervalSince1970)),
-                .int(Int64(interval.end.timeIntervalSince1970))
-            ]
-        )
-        var remainingInvalid = min(invalidCount, source.reduce(0) { $0 + $1.int(1) })
-        var remainingTotal = source.reduce(0) { $0 + $1.int(1) }
-        for (index, row) in source.enumerated() {
-            let bucket = row.int(0)
-            let count = row.int(1)
-            let removal: Int64
-            if index == source.index(before: source.endIndex) {
-                removal = min(count, remainingInvalid)
-            } else if remainingTotal > 0 {
-                removal = min(
-                    count,
-                    Int64((Double(remainingInvalid) * Double(count) / Double(remainingTotal)).rounded())
-                )
-            } else {
-                removal = 0
-            }
-            try prepared(
-                "UPDATE \(table) SET count = count - ? WHERE bucket_start = ? AND device_id = ?",
-                bindings: [.int(removal), .int(bucket), .text(deviceID)]
-            )
-            remainingInvalid -= removal
-            remainingTotal -= count
-        }
-        try prepared(
-            "DELETE FROM \(table) WHERE device_id = ? AND count <= 0",
-            bindings: [.text(deviceID)]
-        )
-    }
-
     // MARK: State and date helpers
-
-    private func canonicalSignatureFromSource() throws -> String {
-        let total = try intValue("SELECT COALESCE(SUM(count), 0) FROM daily_device_key_counts") ?? 0
-        return "v1:\(total)"
-    }
-
-    private func prepareCanonicalStateForWrite() throws -> (total: Int64, reconciled: Bool) {
-        let stored = try textValue(
-            "SELECT canonical_signature FROM statistics_state WHERE singleton = 1",
-            bindings: []
-        ) ?? "v1:0"
-        if stored.hasPrefix("v1:"), let total = Int64(stored.dropFirst(3)) {
-            return (total, false)
-        }
-
-        // A v1 executable can still write the canonical table because the
-        // format is intentionally retained. Persistent triggers mark that as
-        // dirty even when its operation (for example merge) preserves the
-        // global total, so synchronize before accepting another v2 flush.
-        try rebuildDerivedTablesInCurrentTransaction()
-        try validateDerivedTables()
-        let signature = try canonicalSignatureFromSource()
-        try prepared(
-            "UPDATE statistics_state SET canonical_signature = ? WHERE singleton = 1",
-            bindings: [.text(signature)]
-        )
-        return (Int64(signature.dropFirst(3)) ?? 0, true)
-    }
-
-    private func refreshCanonicalSignature() throws {
-        try prepared(
-            "UPDATE statistics_state SET canonical_signature = ? WHERE singleton = 1",
-            bindings: [.text(try canonicalSignatureFromSource())]
-        )
-    }
-
-    private func setCanonicalSignature(total: Int64) throws {
-        try prepared(
-            "UPDATE statistics_state SET canonical_signature = ? WHERE singleton = 1",
-            bindings: [.text("v1:\(total)")]
-        )
-    }
 
     private func bumpRevision() throws -> Int64 {
         try run("UPDATE statistics_state SET revision = revision + 1 WHERE singleton = 1;")
         return try revision()
-    }
-
-    private func localDayInterval(_ value: String) -> DateInterval? {
-        guard let components = Self.dayComponents(value) else { return nil }
-        let calendar = Calendar.autoupdatingCurrent
-        guard let start = calendar.date(from: components),
-              let end = calendar.date(byAdding: .day, value: 1, to: start) else { return nil }
-        return DateInterval(start: start, end: end)
     }
 
     private static func completeMonths(fromDay: String, toDay: String) -> [String] {
@@ -1183,10 +744,10 @@ final class SQLiteStore: @unchecked Sendable {
     }
 
     @discardableResult
-    private func prepared(_ sql: String, bindings: [V2Binding]) throws -> Int32 {
-        let statement = try prepareV2(sql)
+    private func prepared(_ sql: String, bindings: [SQLBinding]) throws -> Int32 {
+        let statement = try prepare(sql)
         defer { sqlite3_finalize(statement) }
-        try bindV2(bindings, to: statement)
+        try bind(bindings, to: statement)
         let result = sqlite3_step(statement)
         guard result == SQLITE_DONE else {
             if result == SQLITE_INTERRUPT { throw CancellationError() }
@@ -1195,14 +756,14 @@ final class SQLiteStore: @unchecked Sendable {
         return sqlite3_changes(database)
     }
 
-    private func batch(_ sql: String, rows: [[V2Binding]]) throws {
+    private func batch(_ sql: String, rows: [[SQLBinding]]) throws {
         guard !rows.isEmpty else { return }
-        let statement = try prepareV2(sql)
+        let statement = try prepare(sql)
         defer { sqlite3_finalize(statement) }
         for bindings in rows {
             sqlite3_reset(statement)
             sqlite3_clear_bindings(statement)
-            try bindV2(bindings, to: statement)
+            try bind(bindings, to: statement)
             let result = sqlite3_step(statement)
             guard result == SQLITE_DONE else {
                 if result == SQLITE_INTERRUPT { throw CancellationError() }
@@ -1211,24 +772,24 @@ final class SQLiteStore: @unchecked Sendable {
         }
     }
 
-    private func intValue(_ sql: String, bindings: [V2Binding] = []) throws -> Int64? {
+    private func intValue(_ sql: String, bindings: [SQLBinding] = []) throws -> Int64? {
         try rows(sql, bindings: bindings).first?.optionalInt(0)
     }
 
-    private func textValue(_ sql: String, bindings: [V2Binding]) throws -> String? {
+    private func textValue(_ sql: String, bindings: [SQLBinding]) throws -> String? {
         try rows(sql, bindings: bindings).first?.optionalText(0)
     }
 
-    private func rows(_ sql: String, bindings: [V2Binding] = []) throws -> [V2Row] {
-        let statement = try prepareV2(sql)
+    private func rows(_ sql: String, bindings: [SQLBinding] = []) throws -> [SQLRow] {
+        let statement = try prepare(sql)
         defer { sqlite3_finalize(statement) }
-        try bindV2(bindings, to: statement)
-        var resultRows: [V2Row] = []
+        try bind(bindings, to: statement)
+        var resultRows: [SQLRow] = []
         while true {
             let result = sqlite3_step(statement)
             switch result {
             case SQLITE_ROW:
-                let columns = (0..<sqlite3_column_count(statement)).map { index -> V2Column in
+                let columns = (0..<sqlite3_column_count(statement)).map { index -> SQLColumn in
                     switch sqlite3_column_type(statement, index) {
                     case SQLITE_NULL:
                         return .null
@@ -1239,7 +800,7 @@ final class SQLiteStore: @unchecked Sendable {
                         return .text(String(cString: value))
                     }
                 }
-                resultRows.append(V2Row(columns: columns))
+                resultRows.append(SQLRow(columns: columns))
             case SQLITE_DONE:
                 return resultRows
             case SQLITE_INTERRUPT:
@@ -1250,7 +811,7 @@ final class SQLiteStore: @unchecked Sendable {
         }
     }
 
-    private func prepareV2(_ sql: String) throws -> OpaquePointer? {
+    private func prepare(_ sql: String) throws -> OpaquePointer? {
         var statement: OpaquePointer?
         let result = sqlite3_prepare_v2(database, sql, -1, &statement, nil)
         guard result == SQLITE_OK else {
@@ -1260,7 +821,7 @@ final class SQLiteStore: @unchecked Sendable {
         return statement
     }
 
-    private func bindV2(_ bindings: [V2Binding], to statement: OpaquePointer?) throws {
+    private func bind(_ bindings: [SQLBinding], to statement: OpaquePointer?) throws {
         for (offset, binding) in bindings.enumerated() {
             let index = Int32(offset + 1)
             let result: Int32
@@ -1292,52 +853,46 @@ final class SQLiteStore: @unchecked Sendable {
     ]
 }
 
-private let sqliteStoreV2ProgressCallback: @convention(c) (UnsafeMutableRawPointer?) -> Int32 = { context in
-    guard let context else { return 0 }
-    let store = Unmanaged<SQLiteStore>.fromOpaque(context).takeUnretainedValue()
-    return store.shouldCancelProgress() ? 1 : 0
-}
-
-private struct V2BucketDevice: Hashable {
+private struct BucketDevice: Hashable {
     let bucket: Int64
     let deviceID: UUID
 }
 
-private struct V2DayDevice: Hashable {
+private struct DayDevice: Hashable {
     let day: String
     let deviceID: UUID
 }
 
-private struct V2DayDeviceKey: Hashable {
+private struct DayDeviceKey: Hashable {
     let day: String
     let deviceID: UUID
     let key: HIDKeyID
 }
 
-private struct V2MonthDeviceKey: Hashable {
+private struct MonthDeviceKey: Hashable {
     let month: String
     let deviceID: UUID
     let key: HIDKeyID
 }
 
-private enum V2Binding {
+private enum SQLBinding {
     case int(Int64)
     case text(String)
     case null
 
-    static func optionalText(_ value: String?) -> V2Binding {
-        value.map(V2Binding.text) ?? .null
+    static func optionalText(_ value: String?) -> SQLBinding {
+        value.map(SQLBinding.text) ?? .null
     }
 }
 
-private enum V2Column {
+private enum SQLColumn {
     case int(Int64)
     case text(String)
     case null
 }
 
-private struct V2Row {
-    let columns: [V2Column]
+private struct SQLRow {
+    let columns: [SQLColumn]
 
     func int(_ index: Int) -> Int64 { optionalInt(index) ?? 0 }
 
