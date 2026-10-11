@@ -2,11 +2,14 @@ import CoreHID
 import Foundation
 
 actor CoreHIDInputMonitor {
+    private static let retryDelays = [1, 5, 30]
+
     private var manager = HIDDeviceManager()
     private let engine: StatisticsEngine
     private var monitorTask: Task<Void, Never>?
     private var deviceTasks: [UInt64: Task<Void, Never>] = [:]
     private var retryTasks: [UInt64: Task<Void, Never>] = [:]
+    private var retryAttempts: [UInt64: Int] = [:]
     private var transitions: [UInt64: KeyTransitionCounter] = [:]
     private var canonicalIDs: [UInt64: UUID] = [:]
     private var descriptors: [UInt64: DeviceDescriptor] = [:]
@@ -78,6 +81,7 @@ actor CoreHIDInputMonitor {
         let referenceIDs = Array(canonicalIDs.keys)
         deviceTasks.removeAll()
         retryTasks.removeAll()
+        retryAttempts.removeAll()
         transitions.removeAll()
         canonicalIDs.removeAll()
         descriptors.removeAll()
@@ -220,12 +224,18 @@ actor CoreHIDInputMonitor {
     }
 
     private func observe(client: HIDDeviceClient, reference: HIDDeviceClient.DeviceReference, elements: [HIDElement]) async {
+        var delivered = false
         do {
             for try await notification in await client.monitorNotifications(
                 reportIDsToMonitor: [],
                 elementsToMonitor: elements
             ) {
                 guard !Task.isCancelled else { return }
+                if !delivered {
+                    // Only a stream that actually delivers earns a fresh retry ladder.
+                    delivered = true
+                    retryAttempts.removeValue(forKey: reference.deviceID)
+                }
                 switch notification {
                 case .elementUpdates(let values):
                     for value in values { await process(value, referenceID: reference.deviceID) }
@@ -267,8 +277,8 @@ actor CoreHIDInputMonitor {
         await engine.record(referenceID: referenceID, key: key)
     }
 
-    /// Forgets a device. With `retrying`, its stream ended on its own and attaching
-    /// is retried after 1 s, 5 s and 30 s unless it is removed or monitoring stops.
+    /// Forgets a device. With `retrying`, its stream ended on its own, so attaching
+    /// is retried; otherwise the device is gone and its retry ladder is cleared.
     private func detach(referenceID: UInt64, retrying reference: HIDDeviceClient.DeviceReference? = nil) async {
         let deviceTask = deviceTasks.removeValue(forKey: referenceID)
         retryTasks.removeValue(forKey: referenceID)?.cancel()
@@ -276,20 +286,35 @@ actor CoreHIDInputMonitor {
         canonicalIDs.removeValue(forKey: referenceID)
         descriptors.removeValue(forKey: referenceID)
         if let reference {
-            retryTasks[referenceID] = Task { [weak self] in
-                for delay in [1, 5, 30] {
-                    try? await Task.sleep(for: .seconds(delay))
-                    guard !Task.isCancelled, let self else { return }
-                    await self.attach(reference)
-                    if await self.canonicalIDs[referenceID] != nil { return }
-                }
-            }
+            scheduleRetry(reference)
+        } else {
+            retryAttempts.removeValue(forKey: referenceID)
         }
         await engine.disconnect(referenceID: referenceID)
         await deviceDirectoryDidChange?()
         // Cancel last: this may be the device's own task, and a cancelled task would
         // make the directory refresh above fail with a cancellation error.
         deviceTask?.cancel()
+    }
+
+    /// Consumes the next rung of the 1 s, 5 s, 30 s ladder, which persists across
+    /// attach and detach cycles; once the rungs are used up the device stays detached.
+    private func scheduleRetry(_ reference: HIDDeviceClient.DeviceReference) {
+        let referenceID = reference.deviceID
+        let attempt = retryAttempts[referenceID, default: 0]
+        guard attempt < Self.retryDelays.count else { return }
+        retryAttempts[referenceID] = attempt + 1
+        retryTasks[referenceID] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.retryDelays[attempt]))
+            await self?.retryAttach(reference)
+        }
+    }
+
+    private func retryAttach(_ reference: HIDDeviceClient.DeviceReference) async {
+        guard !Task.isCancelled else { return }
+        await attach(reference)
+        // A failed attach moves on to the next rung; a cancelled one was detached.
+        if !Task.isCancelled, canonicalIDs[reference.deviceID] == nil { scheduleRetry(reference) }
     }
 
     /// The store dropped this device and its fingerprint alias, so a connected
