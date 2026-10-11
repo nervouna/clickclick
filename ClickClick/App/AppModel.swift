@@ -138,6 +138,7 @@ final class AppModel {
         guard let engine else { return }
         do {
             let result = try await engine.deleteDevice(id: id)
+            await monitor?.deviceWasDeleted(id)
             let selectionChanged = clearStatisticsSelection(if: id)
             if !selectionChanged {
                 statisticsViewModel?.consume(result)
