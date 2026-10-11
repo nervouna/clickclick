@@ -205,8 +205,8 @@ final class AppModel {
 
     private func bootstrap(databaseURL: URL) async {
         do {
-            // Opening the store may perform a backup and migration. Keep that work
-            // off MainActor so a large existing database cannot freeze the menu UI.
+            // Opening the store may run a migration. Keep that work off MainActor
+            // so it cannot freeze the menu UI.
             let engine = try await Task.detached(priority: .userInitiated) {
                 try StatisticsEngine(databaseURL: databaseURL)
             }.value
@@ -230,8 +230,7 @@ final class AppModel {
             try await engine.performMaintenance()
             await refreshDashboard()
 
-            // Input listening starts only after migration and its validation have
-            // succeeded. A migration error leaves the database and backup intact.
+            // Input listening starts only after the store has opened successfully.
             permissionState = await monitor.refreshPermission()
         } catch is CancellationError {
             return
