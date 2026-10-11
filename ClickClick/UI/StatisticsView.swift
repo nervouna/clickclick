@@ -103,7 +103,7 @@ private struct OverviewData {
         devices = hideZeroCountDevices
             ? snapshot.devices.filter { $0.totalCount > 0 }
             : snapshot.devices
-        trend = snapshot.trend
+        trend = Self.zeroFilledTrend(snapshot.trend, query: snapshot.query)
         total = snapshot.summary.total
         average = snapshot.summary.average
         peak = snapshot.summary.peak
@@ -113,6 +113,34 @@ private struct OverviewData {
         heatmapCounts = snapshot.heatmapCounts
         heatmapMaximum = snapshot.heatmapMaximum
         heatmapMediaCounts = snapshot.heatmapMediaCounts
+    }
+
+    /// Emits a point for every bucket in the range for each device that has data, so charts
+    /// do not interpolate across gaps. The snapshot itself stays sparse.
+    private static func zeroFilledTrend(_ points: [TrendPoint], query: StatisticsQuery) -> [TrendPoint] {
+        guard !points.isEmpty else { return [] }
+        var counts: [TrendPointID: Int64] = [:]
+        var names: [UUID: String] = [:]
+        for point in points {
+            counts[point.id] = point.count
+            names[point.deviceID] = point.deviceName
+        }
+        let deviceIDs = names.keys.sorted { $0.uuidString < $1.uuidString }
+        let dates = Set(query.bucketStarts).union(points.map(\.date)).sorted()
+
+        var filled: [TrendPoint] = []
+        filled.reserveCapacity(dates.count * deviceIDs.count)
+        for date in dates {
+            for deviceID in deviceIDs {
+                filled.append(TrendPoint(
+                    date: date,
+                    deviceID: deviceID,
+                    deviceName: names[deviceID] ?? "",
+                    count: counts[TrendPointID(bucketStart: date, deviceID: deviceID)] ?? 0
+                ))
+            }
+        }
+        return filled
     }
 }
 
@@ -139,6 +167,7 @@ private struct OverviewView: View {
                 )
                 TrendChartView(
                     points: data.trend,
+                    domain: data.rangeStart...data.rangeEnd,
                     showsDeviceBreakdown: selectedDeviceID == nil
                 )
                 HStack(alignment: .top, spacing: 18) {
@@ -216,6 +245,7 @@ private struct SummaryCards: View {
 
 private struct TrendChartView: View {
     let points: [TrendPoint]
+    let domain: ClosedRange<Date>
     let showsDeviceBreakdown: Bool
 
     var body: some View {
@@ -232,6 +262,7 @@ private struct TrendChartView: View {
                     .foregroundStyle(by: .value("键盘", point.deviceName))
                     .interpolationMethod(.monotone)
                 }
+                .chartXScale(domain: domain)
                 .chartLegend(position: .bottom, alignment: .leading)
                 .frame(height: 280)
             } else {
@@ -246,6 +277,7 @@ private struct TrendChartView: View {
                         y: .value("按键", point.count)
                     )
                 }
+                .chartXScale(domain: domain)
                 .frame(height: 280)
             }
         }

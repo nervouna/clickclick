@@ -162,9 +162,23 @@ struct StatisticsQuery: Hashable, Sendable, Identifiable {
         timestamp >= Int64(rangeStart.timeIntervalSince1970)
             && timestamp < Int64(rangeEnd.timeIntervalSince1970)
     }
+
+    /// Every bucket start in `[rangeStart, rangeEnd)`, using the same bucketing as the statistics reader.
+    var bucketStarts: [Date] {
+        let calendar = calendar
+        var starts: [Date] = []
+        var cursor = TimeBuckets.start(of: granularity, for: rangeStart, calendar: calendar)
+        while cursor < rangeEnd {
+            if cursor >= rangeStart { starts.append(cursor) }
+            let next = granularity.nextBucket(after: cursor, calendar: calendar)
+            guard next > cursor else { break }
+            cursor = next
+        }
+        return starts
+    }
 }
 
-private extension TrendGranularity {
+extension TrendGranularity {
     func nextBucket(after start: Date, calendar: Calendar) -> Date {
         let component: Calendar.Component
         switch self {
@@ -225,6 +239,9 @@ struct StatisticsSnapshot: Equatable, Sendable {
             points.reduce(Int64(0)) { $0 + $1.count }
         }
         let total = stableTrend.reduce(Int64(0)) { $0 + $1.count }
+        let bucketSpan: Int64 = grouped.keys.min().map { first in
+            Int64(max(1, query.bucketStarts.lazy.filter { $0 >= first }.count))
+        } ?? 0
 
         self.query = query
         self.revision = revision
@@ -239,7 +256,7 @@ struct StatisticsSnapshot: Equatable, Sendable {
         consumerRanking = consumer
         summary = StatisticsSummary(
             total: total,
-            average: grouped.isEmpty ? 0 : total / Int64(grouped.count),
+            average: bucketSpan == 0 ? 0 : total / bucketSpan,
             peak: grouped.values.max() ?? 0,
             activeDeviceCount: Set(stableTrend.map(\.deviceID)).count
         )

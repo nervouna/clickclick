@@ -149,6 +149,71 @@ struct CountingTests {
         #expect(next)
     }
 
+    @Test func hourBucketStartsAreEpochAlignedAndContiguous() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(identifier: "Asia/Kolkata"))
+        let now = Date(timeIntervalSince1970: 1_773_146_040) // 2026-03-10T12:34:00Z
+        let query = StatisticsQuery(granularity: .hour, deviceID: nil, now: now, calendar: calendar)
+
+        let starts = query.bucketStarts
+        #expect(starts.count == 7 * 24)
+        #expect(starts.first == query.rangeStart)
+        #expect(starts.last == query.currentBucketStart)
+        #expect(starts.allSatisfy { Int64($0.timeIntervalSince1970) % 3_600 == 0 })
+        #expect(zip(starts, starts.dropFirst()).allSatisfy { $1.timeIntervalSince($0) == 3_600 })
+    }
+
+    @Test func monthBucketStartsFollowCalendarMonthLengths() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(identifier: "America/Los_Angeles"))
+        let now = try #require(calendar.date(from: DateComponents(year: 2026, month: 3, day: 15, hour: 9)))
+        let query = StatisticsQuery(granularity: .month, deviceID: nil, now: now, calendar: calendar)
+
+        let starts = query.bucketStarts
+        #expect(starts.count == 24)
+        #expect(starts.first == query.rangeStart)
+        #expect(starts.last == query.currentBucketStart)
+        #expect(starts.allSatisfy { calendar.component(.day, from: $0) == 1 && calendar.component(.hour, from: $0) == 0 })
+
+        let february = try #require(calendar.date(from: DateComponents(year: 2025, month: 2, day: 1)))
+        let march = try #require(calendar.date(from: DateComponents(year: 2025, month: 3, day: 1)))
+        let index = try #require(starts.firstIndex(of: february))
+        #expect(starts[index + 1] == march)
+        #expect(calendar.dateComponents([.day], from: february, to: march).day == 28)
+    }
+
+    @Test func averageSpansFromFirstDataBucketToRangeEnd() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(identifier: "UTC"))
+        let now = Date(timeIntervalSince1970: 1_773_146_040)
+        let query = StatisticsQuery(granularity: .hour, deviceID: nil, now: now, calendar: calendar)
+        let starts = query.bucketStarts
+        #expect(starts.count == 168)
+
+        let deviceID = UUID()
+        let device = keyboardDevice(id: deviceID, count: 400)
+        func point(_ date: Date, _ count: Int64) -> TrendPoint {
+            TrendPoint(date: date, deviceID: deviceID, deviceName: "Keyboard", count: count)
+        }
+
+        let snapshot = StatisticsSnapshot(
+            query: query,
+            revision: 1,
+            devices: [device],
+            trend: [point(starts[100], 300), point(starts[150], 100)],
+            keyCounts: []
+        )
+        // Buckets 100...167 inclusive: 68 buckets, 400 / 68 == 5.
+        #expect(snapshot.summary.total == 400)
+        #expect(snapshot.summary.average == 400 / 68)
+        #expect(snapshot.summary.peak == 300)
+        #expect(snapshot.summary.activeDeviceCount == 1)
+        #expect(snapshot.trend.count == 2)
+
+        let empty = StatisticsSnapshot(query: query, revision: 1, devices: [device], trend: [], keyCounts: [])
+        #expect(empty.summary == .empty)
+    }
+
     private func keyboardDevice(id: UUID, count: Int64, isHidden: Bool = false) -> KeyboardDevice {
         KeyboardDevice(
             id: id,

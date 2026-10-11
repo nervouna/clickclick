@@ -75,7 +75,11 @@ struct MenuBarView: View {
 
     private func color(for id: UUID) -> Color {
         let palette: [Color] = [.blue, .purple, .orange, .green, .pink, .cyan]
-        return palette[abs(id.hashValue) % palette.count]
+        // Derived from the UUID bytes so the colour is stable across launches.
+        let hash = withUnsafeBytes(of: id.uuid) { bytes in
+            bytes.reduce(UInt64(5381)) { ($0 << 5) &+ $0 &+ UInt64($1) }
+        }
+        return palette[Int(hash % UInt64(palette.count))]
     }
 }
 
