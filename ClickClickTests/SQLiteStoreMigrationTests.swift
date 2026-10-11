@@ -3,463 +3,101 @@ import SQLite3
 import Testing
 @testable import ClickClick
 
-struct SQLiteStoreMigrationTests {
-    @Test func migrationPreservesAllFiveTrendGranularities() async throws {
-        let fixture = try LegacyStoreFixture()
-        try fixture.createCanonicalV1()
-        try fixture.addAlignedLegacyTimeSeries()
-        _ = try SQLiteStore(url: fixture.databaseURL)
-        let reader = try StatisticsReader(databaseURL: fixture.databaseURL)
-        let calendar = fixture.calendar
-        let from = try #require(fixture.date("2026-01-01"))
-        let to = try #require(fixture.date("2026-03-01"))
-
-        for granularity in TrendGranularity.allCases {
-            let points = try await reader.trend(
-                granularity: granularity,
-                from: from,
-                to: to,
-                deviceID: fixture.visibleID,
-                calendar: calendar
-            )
-            #expect(
-                points.reduce(0) { $0 + $1.count } == 39,
-                "\(granularity.rawValue) migration total changed"
-            )
-        }
-    }
-
-    @Test func migratesV1OnceCreatesBackupAndBackfillsEveryReadModel() throws {
-        let fixture = try LegacyStoreFixture()
-        try fixture.createCanonicalV1()
-
-        do {
-            let store = try SQLiteStore(url: fixture.databaseURL)
-            #expect(try store.revision() == 0)
-
-            let devices = try store.fetchDevices(connected: [])
-            #expect(devices.first(where: { $0.id == fixture.visibleID })?.totalCount == 39)
-            #expect(devices.first(where: { $0.id == fixture.hiddenID })?.totalCount == 17)
-
-            let daily = try store.dailyTrendRows(
-                fromDay: "2026-01-01",
-                toDay: "2026-02-28",
-                deviceID: fixture.visibleID
-            )
-            #expect(daily.map(\.count).reduce(0, +) == 39)
-            #expect(daily.count == 5)
-
-            let keys = try store.keyCounts(
-                fromDay: "2026-01-01",
-                toDay: "2026-02-28",
-                deviceID: fixture.visibleID
-            )
-            #expect(keys.reduce(0) { $0 + $1.count } == 39)
-            #expect(keys.first(where: { $0.key.usage == 4 })?.count == 32)
-            #expect(keys.first(where: { $0.key.usage == 5 })?.count == 7)
-            #expect(
-                try store.keyCounts(
-                    fromDay: "2026-01-01",
-                    toDay: "2026-02-28",
-                    deviceID: fixture.hiddenID
-                ).isEmpty
-            )
-        }
-
-        #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
-        #expect(try fixture.int("PRAGMA user_version") == 2)
-        #expect(try fixture.int("SELECT SUM(count) FROM daily_device_counts") == 56)
-        #expect(try fixture.int("SELECT SUM(count) FROM monthly_device_key_counts") == 56)
-        #expect(try fixture.int("SELECT SUM(count) FROM device_total_counts") == 56)
-
-        // A second open must not add the canonical rows again or replace the
-        // one-time v1 backup.
-        let backupAttributes = try FileManager.default.attributesOfItem(atPath: fixture.backupURL.path)
-        let backupDate = backupAttributes[.modificationDate] as? Date
-        _ = try SQLiteStore(url: fixture.databaseURL)
-        #expect(try fixture.int("SELECT SUM(count) FROM daily_device_counts") == 56)
-        #expect(
-            (try FileManager.default.attributesOfItem(atPath: fixture.backupURL.path)[.modificationDate] as? Date)
-                == backupDate
-        )
-
-        let backup = try LegacyStoreFixture.readOnly(url: fixture.backupURL)
-        defer { sqlite3_close(backup) }
-        #expect(try LegacyStoreFixture.int("PRAGMA user_version", database: backup) == 0)
-        #expect(
-            try LegacyStoreFixture.int(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_device_counts')",
-                database: backup
-            ) == 0
-        )
-    }
-
-    @Test func migrationRepairsReservedKeysBeforeBackfillAndAdjustsTimeSeries() throws {
-        let fixture = try LegacyStoreFixture()
-        try fixture.createCanonicalV1()
-        let date = Date()
-        let day = TimeBuckets.localDay(for: date)
-        let minute = TimeBuckets.minute(for: date)
-        let hour = TimeBuckets.hour(for: date)
-        try fixture.execute("""
-            INSERT INTO minute_device_counts VALUES (\(minute), '\(fixture.visibleID.uuidString)', 9);
-            INSERT INTO hourly_device_counts VALUES (\(hour), '\(fixture.visibleID.uuidString)', 9);
-            INSERT INTO daily_device_key_counts VALUES
-                ('\(day)', '\(fixture.visibleID.uuidString)', 7, 0, 4),
-                ('\(day)', '\(fixture.visibleID.uuidString)', 7, 6, 5);
-            """)
-
+struct SQLiteStoreTests {
+    @Test func freshDatabaseGetsTheCurrentSchema() throws {
+        let fixture = try StoreFixture()
         let store = try SQLiteStore(url: fixture.databaseURL)
-        #expect(
-            try store.keyCounts(fromDay: day, toDay: day, deviceID: fixture.visibleID)
-                == [KeyCount(key: HIDKeyID(usagePage: 7, usage: 6), count: 5)]
-        )
-        #expect(
-            try store.trendRows(
-                from: date.addingTimeInterval(-60),
-                to: date.addingTimeInterval(60),
-                minute: true,
-                deviceID: fixture.visibleID
-            ).reduce(0) { $0 + $1.3 } == 5
-        )
-        #expect(
-            try store.trendRows(
-                from: date.addingTimeInterval(-3_600),
-                to: date.addingTimeInterval(3_600),
-                minute: false,
-                deviceID: fixture.visibleID
-            ).reduce(0) { $0 + $1.3 } == 5
-        )
-        #expect(
-            try fixture.int(
-                "SELECT COUNT(*) FROM daily_device_key_counts WHERE (usage_page = 7 AND usage BETWEEN 0 AND 3) OR (usage_page = 12 AND usage = 0)"
-            ) == 0
-        )
-        #expect(try fixture.int("SELECT SUM(count) FROM device_total_counts") == 61)
+
+        #expect(try store.revision() == 0)
+        #expect(try fixture.int("PRAGMA user_version") == Int64(SQLiteStore.schemaVersion))
+        #expect(try fixture.int("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'") == 0)
+        #expect(try fixture.int("SELECT COUNT(*) FROM pragma_table_info('statistics_state')") == 2)
     }
 
     @Test func keyQueryCombinesPartialEdgesWithCompleteMiddleMonths() throws {
-        let fixture = try LegacyStoreFixture()
-        try fixture.createCanonicalV1()
+        let fixture = try StoreFixture()
         let store = try SQLiteStore(url: fixture.databaseURL)
-        _ = try store.apply([
+        let (visible, hidden) = try fixture.seed(store)
+        try store.apply([
             CountIncrement(
                 minute: 0,
                 hour: 0,
                 localDay: "2026-03-15",
-                deviceID: fixture.visibleID,
+                deviceID: visible,
                 key: HIDKeyID(usagePage: 7, usage: 4),
                 count: 19
             )
         ])
 
         // Jan and Mar are daily edge reads; all of Feb is served by the month
-        // rollup. The result keeps the old inclusive local-day semantics.
-        let result = try store.keyCounts(
-            fromDay: "2026-01-15",
-            toDay: "2026-03-15",
-            deviceID: fixture.visibleID
-        )
+        // rollup. The result keeps inclusive local-day semantics.
+        let result = try store.keyCounts(fromDay: "2026-01-15", toDay: "2026-03-15", deviceID: visible)
         #expect(result.reduce(0) { $0 + $1.count } == 55)
         #expect(result.first(where: { $0.key.usage == 4 })?.count == 48)
         #expect(result.first(where: { $0.key.usage == 5 })?.count == 7)
         #expect(
-            try store.keyCounts(
-                fromDay: "2026-01-15",
-                toDay: "2026-03-15",
-                deviceID: fixture.hiddenID
-            ).isEmpty
+            try store.keyCounts(fromDay: "2026-01-15", toDay: "2026-03-15", deviceID: hidden).isEmpty
         )
     }
 
-    @Test func canonicalSignatureDetectsLegacyWriterDriftAndRebuildsIdempotently() throws {
-        let fixture = try LegacyStoreFixture()
-        try fixture.createCanonicalV1()
-        var priorRevision: Int64 = 0
-        do {
-            let store = try SQLiteStore(url: fixture.databaseURL)
-            priorRevision = try store.revision()
-        }
-
-        // Simulate an old executable writing only the canonical v1 table after
-        // this process has already migrated the database.
-        try fixture.execute(
-            "UPDATE daily_device_key_counts SET count = count + 4 WHERE device_id = '\(fixture.visibleID.uuidString)' AND local_day = '2026-01-15' AND usage = 4;"
-        )
-        do {
-            let reopened = try SQLiteStore(url: fixture.databaseURL)
-            #expect(try reopened.revision() == priorRevision + 1)
-            #expect(
-                try reopened.fetchDevices(connected: []).first(where: { $0.id == fixture.visibleID })?.totalCount == 43
-            )
-            #expect(
-                try reopened.keyCounts(
-                    fromDay: "2026-01-01",
-                    toDay: "2026-02-28",
-                    deviceID: fixture.visibleID
-                ).reduce(0) { $0 + $1.count } == 43
-            )
-        }
-
-        let rebuiltRevision = try fixture.int("SELECT revision FROM statistics_state")
-        _ = try SQLiteStore(url: fixture.databaseURL)
-        #expect(try fixture.int("SELECT revision FROM statistics_state") == rebuiltRevision)
-
-        // A legacy merge preserves the global total, so a total-only startup
-        // comparison would miss it. Persistent canonical triggers mark this
-        // rewrite dirty and force the device-level derived rows to rebuild.
-        try fixture.execute("""
-            INSERT INTO daily_device_key_counts (local_day, device_id, usage_page, usage, count)
-            SELECT local_day, '\(fixture.visibleID.uuidString)', usage_page, usage, count
-            FROM daily_device_key_counts WHERE device_id = '\(fixture.hiddenID.uuidString)'
-            ON CONFLICT(local_day, device_id, usage_page, usage)
-            DO UPDATE SET count = count + excluded.count;
-            DELETE FROM daily_device_key_counts WHERE device_id = '\(fixture.hiddenID.uuidString)';
-            UPDATE device_aliases SET device_id = '\(fixture.visibleID.uuidString)'
-            WHERE device_id = '\(fixture.hiddenID.uuidString)';
-            DELETE FROM devices WHERE id = '\(fixture.hiddenID.uuidString)';
-            """)
-        let beforeLegacyMergeRecovery = try fixture.int("SELECT revision FROM statistics_state")
-        do {
-            let recovered = try SQLiteStore(url: fixture.databaseURL)
-            #expect(try recovered.revision() == beforeLegacyMergeRecovery + 1)
-            let devices = try recovered.fetchDevices(connected: [])
-            #expect(devices.count == 1)
-            #expect(devices[0].id == fixture.visibleID)
-            #expect(devices[0].totalCount == 60)
-        }
-    }
-
-    @Test func destructivePrivacyMutationsRemoveV1BackupIncludingDatabaseNoOps() throws {
-        for mutation in BackupRemovingMutation.allCases {
-            let fixture = try LegacyStoreFixture()
-            try fixture.createCanonicalV1()
-            let store = try SQLiteStore(url: fixture.databaseURL)
-            #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
-
-            try mutation.perform(on: store, fixture: fixture, noOp: false)
-
-            #expect(
-                !FileManager.default.fileExists(atPath: fixture.backupURL.path),
-                "\(mutation) retained the recoverable v1 backup"
-            )
-        }
-
-        for mutation in BackupRemovingMutation.allCases {
-            let fixture = try LegacyStoreFixture()
-            try fixture.createCanonicalV1()
-            let store = try SQLiteStore(url: fixture.databaseURL)
-            try mutation.prepareNoOp(fixture: fixture)
-            #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
-
-            try mutation.perform(on: store, fixture: fixture, noOp: true)
-
-            #expect(
-                !FileManager.default.fileExists(atPath: fixture.backupURL.path),
-                "\(mutation) no-op retained the recoverable v1 backup"
-            )
-        }
-    }
-
-    @Test func backupRemovalFailurePreventsEveryActiveDatabaseMutation() throws {
-        let countQueries = [
-            "SELECT COALESCE(SUM(count), 0) FROM minute_device_counts",
-            "SELECT COALESCE(SUM(count), 0) FROM hourly_device_counts",
-            "SELECT COALESCE(SUM(count), 0) FROM daily_device_key_counts",
-            "SELECT COALESCE(SUM(count), 0) FROM daily_device_counts",
-            "SELECT COALESCE(SUM(count), 0) FROM monthly_device_key_counts",
-            "SELECT COALESCE(SUM(count), 0) FROM device_total_counts"
-        ]
-        for mutation in BackupRemovingMutation.allCases {
-            let fixture = try LegacyStoreFixture()
-            try fixture.createCanonicalV1()
-            let store = try SQLiteStore(
-                url: fixture.databaseURL,
-                backupRemover: { _ in throw InjectedBackupRemovalError() }
-            )
-            let countsBefore = try countQueries.map { try fixture.int($0) }
-            let devicesBefore = try fixture.int("SELECT COUNT(*) FROM devices")
-            let revisionBefore = try store.revision()
-
-            #expect(throws: (any Error).self) {
-                try mutation.perform(on: store, fixture: fixture, noOp: false)
-            }
-
-            #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
-            #expect(try countQueries.map { try fixture.int($0) } == countsBefore)
-            #expect(try fixture.int("SELECT COUNT(*) FROM devices") == devicesBefore)
-            #expect(try store.revision() == revisionBefore)
-        }
-    }
-
-    @Test func fileNotFoundRemovalResultIsVerifiedAgainstTheBackupPath() throws {
-        let fixture = try LegacyStoreFixture()
-        try fixture.createCanonicalV1()
-        let store = try SQLiteStore(
-            url: fixture.databaseURL,
-            backupRemover: { _ in throw CocoaError(.fileNoSuchFile) }
-        )
-        let revisionBefore = try store.revision()
-
-        #expect(throws: (any Error).self) {
-            _ = try store.clearCounts(deviceID: fixture.visibleID)
-        }
-
-        #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
-        #expect(try fixture.int("SELECT SUM(count) FROM daily_device_key_counts") == 56)
-        #expect(try store.revision() == revisionBefore)
-    }
-
-    @Test func failedMutationRollsBackCanonicalReconciliationAndRetainsBackup() throws {
-        let fixture = try LegacyStoreFixture()
-        try fixture.createCanonicalV1()
-        try fixture.addAlignedLegacyTimeSeries()
+    @Test func hiddenFiltersAndMutationsStayConsistentAcrossAllCountTables() throws {
+        let fixture = try StoreFixture()
         let store = try SQLiteStore(url: fixture.databaseURL)
-        let revisionBeforeLegacyWrite = try store.revision()
-        try fixture.execute("""
-            UPDATE daily_device_key_counts SET count = count + 4
-            WHERE device_id = '\(fixture.hiddenID.uuidString)'
-              AND local_day = '2026-01-15' AND usage = 4;
-            CREATE TRIGGER fail_reconciled_clear
-            BEFORE DELETE ON minute_device_counts
-            BEGIN SELECT RAISE(ABORT, 'injected post-reconciliation failure'); END;
-            """)
+        let (visible, hidden) = try fixture.seed(store)
+        try fixture.expectEveryCountTable(total: 56)
 
-        #expect(throws: (any Error).self) {
-            _ = try store.clearCounts(deviceID: fixture.visibleID)
-        }
-
-        #expect(try store.revision() == revisionBeforeLegacyWrite)
-        #expect(try fixture.int("SELECT canonical_signature = 'dirty' FROM statistics_state") == 1)
-        #expect(try fixture.int("SELECT SUM(count) FROM daily_device_key_counts") == 60)
-        #expect(try fixture.int("SELECT SUM(count) FROM daily_device_counts") == 56)
-        #expect(try fixture.int("SELECT SUM(count) FROM monthly_device_key_counts") == 56)
-        #expect(try fixture.int("SELECT SUM(count) FROM device_total_counts") == 56)
-        #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
-    }
-
-    @Test func destructiveMutationsReconcileDirtyCanonicalDataBeforePublishing() throws {
-        for mutation in DirtyCanonicalMutation.allCases {
-            let fixture = try LegacyStoreFixture()
-            try fixture.createCanonicalV1()
-            var publishedRevision: Int64 = 0
-
-            do {
-                let store = try SQLiteStore(url: fixture.databaseURL)
-                let revisionBeforeLegacyWrite = try store.revision()
-                try fixture.execute(
-                    "UPDATE daily_device_key_counts SET count = count + 4 "
-                        + "WHERE device_id = '\(mutation.dirtyDeviceID(fixture: fixture).uuidString)' "
-                        + "AND local_day = '2026-01-15' AND usage = 4;"
-                )
-
-                publishedRevision = try mutation.perform(on: store, fixture: fixture)
-
-                #expect(
-                    publishedRevision == revisionBeforeLegacyWrite + 1,
-                    "\(mutation) did not publish exactly one reconciled revision"
-                )
-                try mutation.expectReadModels(on: store, fixture: fixture)
-            }
-
-            let reopened = try SQLiteStore(url: fixture.databaseURL)
-            #expect(
-                try reopened.revision() == publishedRevision,
-                "\(mutation) left drift that required another startup rebuild"
-            )
-            try mutation.expectReadModels(on: reopened, fixture: fixture)
-        }
-    }
-
-    @Test func cleanMutationNoOpsDoNotAdvanceRevision() throws {
-        let fixture = try LegacyStoreFixture()
-        try fixture.createCanonicalV1()
-        let store = try SQLiteStore(url: fixture.databaseURL)
-        let baseline = try store.revision()
-
-        #expect(try store.mergeDevice(source: fixture.visibleID, target: fixture.visibleID) == baseline)
-        #expect(try store.clearCounts(deviceID: UUID()) == baseline)
-        #expect(try store.deleteDevice(id: UUID()) == baseline)
-        #expect(try store.revision() == baseline)
-    }
-
-    @Test func migrationFailureRollsBackSchemaAndCanonicalRows() throws {
-        let fixture = try LegacyStoreFixture()
-        try fixture.createCanonicalV1()
-        // A legacy/corrupt object with the v2 name makes the backfill fail. All
-        // migration mutations, including invalid-key repair, must roll back.
-        try fixture.execute("CREATE TABLE daily_device_counts (unexpected TEXT);")
-
-        #expect(throws: (any Error).self) {
-            _ = try SQLiteStore(url: fixture.databaseURL)
-        }
-        #expect(FileManager.default.fileExists(atPath: fixture.backupURL.path))
-        #expect(try fixture.int("PRAGMA user_version") == 0)
-        #expect(try fixture.int("SELECT SUM(count) FROM daily_device_key_counts") == 56)
+        // Hidden devices are absent from every query without a device selector.
         #expect(
-            try fixture.int(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='monthly_device_key_counts')"
-            ) == 0
+            try store.keyCounts(fromDay: "2026-01-01", toDay: "2026-02-28", deviceID: nil)
+                .reduce(0) { $0 + $1.count } == 39
         )
-    }
-
-    @Test func hiddenFiltersAndMutationsStayConsistentAcrossAllAggregates() throws {
-        let fixture = try LegacyStoreFixture()
-        try fixture.createCanonicalV1()
-        let store = try SQLiteStore(url: fixture.databaseURL)
-
-        // Hidden devices are absent even from key queries without an explicit
-        // device selector.
-        let visibleKeys = try store.keyCounts(
-            fromDay: "2026-01-01",
-            toDay: "2026-02-28",
-            deviceID: nil
+        #expect(
+            try store.dailyTrendRows(fromDay: "2026-01-01", toDay: "2026-02-28", deviceID: nil)
+                .map(\.count).reduce(0, +) == 39
         )
-        #expect(visibleKeys.reduce(0) { $0 + $1.count } == 39)
+        let devices = try store.fetchDevices(connected: [])
+        #expect(devices.first(where: { $0.id == visible })?.totalCount == 39)
+        #expect(devices.first(where: { $0.id == hidden })?.totalCount == 17)
 
         let revisionBeforeMerge = try store.revision()
-        let mergeRevision = try store.mergeDevice(source: fixture.hiddenID, target: fixture.visibleID)
+        let mergeRevision = try store.mergeDevice(source: hidden, target: visible)
         #expect(mergeRevision == revisionBeforeMerge + 1)
-        let mergedDevices = try store.fetchDevices(connected: [])
-        #expect(mergedDevices.count == 1)
-        #expect(mergedDevices[0].totalCount == 56)
-        #expect(
-            try store.keyCounts(
-                fromDay: "2026-01-01",
-                toDay: "2026-02-28",
-                deviceID: fixture.visibleID
-            ).reduce(0) { $0 + $1.count } == 56
-        )
+        let merged = try store.fetchDevices(connected: [])
+        #expect(merged.count == 1)
+        #expect(merged[0].totalCount == 56)
+        try fixture.expectEveryCountTable(total: 56)
 
-        let clearRevision = try store.clearCounts(deviceID: fixture.visibleID)
+        let clearRevision = try store.clearCounts(deviceID: visible)
         #expect(clearRevision == mergeRevision + 1)
-        #expect(try store.fetchDevices(connected: [fixture.visibleID])[0].totalCount == 0)
+        #expect(try store.fetchDevices(connected: [visible])[0].totalCount == 0)
         #expect(try store.dailyTrendRows(fromDay: "2026-01-01", toDay: "2026-02-28", deviceID: nil).isEmpty)
         #expect(try store.keyCounts(fromDay: "2026-01-01", toDay: "2026-02-28", deviceID: nil).isEmpty)
-        #expect(try fixture.int("SELECT SUM(count) FROM monthly_device_key_counts") == 0)
+        try fixture.expectEveryCountTable(total: 0)
 
-        // A partially written/legacy process may leave a time-series row even
-        // when canonical daily rows are empty. Clear operations still remove
-        // every aggregate and publish a revision.
-        try fixture.execute(
-            "INSERT INTO minute_device_counts VALUES (123, '\(fixture.visibleID.uuidString)', 9);"
-        )
-        let orphanRevision = try store.clearCounts(deviceID: fixture.visibleID)
-        #expect(orphanRevision == clearRevision + 1)
-        #expect(try fixture.int("SELECT COUNT(*) FROM minute_device_counts") == 0)
+        let applyRevision = try store.apply([
+            CountIncrement(
+                minute: 60,
+                hour: 0,
+                localDay: "2026-03-01",
+                deviceID: visible,
+                key: HIDKeyID(usagePage: 7, usage: 4),
+                count: 4
+            )
+        ])
+        try fixture.expectEveryCountTable(total: 4)
+        #expect(try store.clearAllCounts() == applyRevision + 1)
+        try fixture.expectEveryCountTable(total: 0)
+        #expect(try store.fetchDevices(connected: [])[0].id == visible)
 
-        try fixture.execute(
-            "INSERT INTO hourly_device_counts VALUES (456, '\(fixture.visibleID.uuidString)', 7);"
-        )
-        let allRevision = try store.clearAllCounts()
-        #expect(allRevision == orphanRevision + 1)
-        #expect(try fixture.int("SELECT COUNT(*) FROM hourly_device_counts") == 0)
+        let deleteRevision = try store.deleteDevice(id: visible)
+        #expect(deleteRevision == applyRevision + 2)
+        #expect(try store.fetchDevices(connected: []).isEmpty)
     }
 
     @Test func applyPreaggregatesBucketsAndAdvancesRevisionExactlyOnce() throws {
-        let fixture = try LegacyStoreFixture()
+        let fixture = try StoreFixture()
         let store = try SQLiteStore(url: fixture.databaseURL)
-        let deviceID = try store.resolveDevice(fixture.descriptor)
+        let deviceID = try store.resolveDevice(fixture.descriptor("fixture-device", name: "Fixture"))
         let baseline = try store.revision()
         let date = Date(timeIntervalSince1970: 1_800_000_000)
         let minute = TimeBuckets.minute(for: date)
@@ -493,30 +131,177 @@ struct SQLiteStoreMigrationTests {
         #expect(try fixture.int("SELECT SUM(count) FROM monthly_device_key_counts") == 8)
         #expect(try store.apply([]) == revision)
     }
+
+    @Test func cleanMutationNoOpsDoNotAdvanceRevision() throws {
+        let fixture = try StoreFixture()
+        let store = try SQLiteStore(url: fixture.databaseURL)
+        let (visible, _) = try fixture.seed(store)
+        let baseline = try store.revision()
+
+        #expect(try store.mergeDevice(source: visible, target: visible) == baseline)
+        #expect(try store.clearCounts(deviceID: UUID()) == baseline)
+        #expect(try store.deleteDevice(id: UUID()) == baseline)
+        #expect(try store.apply([]) == baseline)
+        #expect(try store.revision() == baseline)
+
+        try store.clearAllCounts()
+        let cleared = try store.revision()
+        #expect(cleared == baseline + 1)
+        #expect(try store.clearAllCounts() == cleared)
+        #expect(try store.pruneMinuteData(before: Int64.max) == cleared)
+    }
+
+    @Test func opensSchemaV2DatabaseAndDropsTheDriftMachinery() throws {
+        let fixture = try StoreFixture()
+        let device = "11111111-1111-1111-1111-111111111111"
+        try fixture.execute("""
+            CREATE TABLE devices (
+                id TEXT PRIMARY KEY, display_name TEXT NOT NULL, manufacturer TEXT, product TEXT,
+                vendor_id INTEGER NOT NULL, product_id INTEGER NOT NULL, transport TEXT,
+                is_built_in INTEGER NOT NULL, is_hidden INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL
+            );
+            CREATE TABLE device_aliases (
+                fingerprint TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE
+            );
+            CREATE TABLE minute_device_counts (
+                bucket_start INTEGER NOT NULL,
+                device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                count INTEGER NOT NULL CHECK(count >= 0),
+                PRIMARY KEY (bucket_start, device_id)
+            );
+            CREATE TABLE hourly_device_counts (
+                bucket_start INTEGER NOT NULL,
+                device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                count INTEGER NOT NULL CHECK(count >= 0),
+                PRIMARY KEY (bucket_start, device_id)
+            );
+            CREATE TABLE daily_device_key_counts (
+                local_day TEXT NOT NULL,
+                device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                usage_page INTEGER NOT NULL, usage INTEGER NOT NULL,
+                count INTEGER NOT NULL CHECK(count >= 0),
+                PRIMARY KEY (local_day, device_id, usage_page, usage)
+            );
+            CREATE TABLE daily_device_counts (
+                local_day TEXT NOT NULL,
+                device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                count INTEGER NOT NULL CHECK(count >= 0),
+                PRIMARY KEY (local_day, device_id)
+            );
+            CREATE TABLE monthly_device_key_counts (
+                local_month TEXT NOT NULL,
+                device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                usage_page INTEGER NOT NULL, usage INTEGER NOT NULL,
+                count INTEGER NOT NULL CHECK(count >= 0),
+                PRIMARY KEY (local_month, device_id, usage_page, usage)
+            );
+            CREATE TABLE device_total_counts (
+                device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+                count INTEGER NOT NULL CHECK(count >= 0)
+            );
+            CREATE TABLE statistics_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                revision INTEGER NOT NULL,
+                canonical_signature TEXT NOT NULL
+            );
+            CREATE TRIGGER mark_statistics_dirty_after_daily_insert
+            AFTER INSERT ON daily_device_key_counts BEGIN
+                UPDATE statistics_state SET canonical_signature = 'dirty' WHERE singleton = 1;
+            END;
+            CREATE TRIGGER mark_statistics_dirty_after_daily_update
+            AFTER UPDATE ON daily_device_key_counts BEGIN
+                UPDATE statistics_state SET canonical_signature = 'dirty' WHERE singleton = 1;
+            END;
+            CREATE TRIGGER mark_statistics_dirty_after_daily_delete
+            AFTER DELETE ON daily_device_key_counts BEGIN
+                UPDATE statistics_state SET canonical_signature = 'dirty' WHERE singleton = 1;
+            END;
+            CREATE INDEX idx_daily_key_device ON daily_device_key_counts(device_id, local_day);
+            INSERT INTO devices VALUES ('\(device)', 'Legacy', 'Test', 'Legacy', 1, 2, 'USB', 0, 0, 1, 1);
+            INSERT INTO device_aliases VALUES ('legacy', '\(device)');
+            INSERT INTO minute_device_counts VALUES (60, '\(device)', 5);
+            INSERT INTO hourly_device_counts VALUES (0, '\(device)', 5);
+            INSERT INTO daily_device_key_counts VALUES ('2026-01-15', '\(device)', 7, 4, 5);
+            INSERT INTO daily_device_counts VALUES ('2026-01-15', '\(device)', 5);
+            INSERT INTO monthly_device_key_counts VALUES ('2026-01', '\(device)', 7, 4, 5);
+            INSERT INTO device_total_counts VALUES ('\(device)', 5);
+            INSERT INTO statistics_state VALUES (1, 7, 'v1:5');
+            PRAGMA user_version = 2;
+            """)
+        try Data("stale backup".utf8).write(to: fixture.backupURL)
+
+        let store = try SQLiteStore(url: fixture.databaseURL)
+
+        #expect(try fixture.int("PRAGMA user_version") == 3)
+        #expect(try fixture.int("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'") == 0)
+        #expect(
+            try fixture.int(
+                "SELECT COUNT(*) FROM pragma_table_info('statistics_state') WHERE name = 'canonical_signature'"
+            ) == 0
+        )
+        #expect(!FileManager.default.fileExists(atPath: fixture.backupURL.path))
+        #expect(try store.revision() == 7)
+        try fixture.expectEveryCountTable(total: 5)
+        #expect(try store.fetchDevices(connected: [])[0].totalCount == 5)
+
+        // The migrated store keeps writing, and reopening it is a no-op.
+        let id = try #require(UUID(uuidString: device))
+        #expect(
+            try store.apply([
+                CountIncrement(
+                    minute: 60,
+                    hour: 0,
+                    localDay: "2026-01-15",
+                    deviceID: id,
+                    key: HIDKeyID(usagePage: 7, usage: 4),
+                    count: 2
+                )
+            ]) == 8
+        )
+        _ = try SQLiteStore(url: fixture.databaseURL)
+        #expect(try fixture.int("PRAGMA user_version") == 3)
+        #expect(try fixture.int("SELECT revision FROM statistics_state") == 8)
+        try fixture.expectEveryCountTable(total: 7)
+    }
+
+    @Test func rejectsLegacyDatabaseAndLeavesItUntouched() throws {
+        let fixture = try StoreFixture()
+        try fixture.execute("""
+            CREATE TABLE devices (
+                id TEXT PRIMARY KEY, display_name TEXT NOT NULL, manufacturer TEXT, product TEXT,
+                vendor_id INTEGER NOT NULL, product_id INTEGER NOT NULL, transport TEXT,
+                is_built_in INTEGER NOT NULL, is_hidden INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL
+            );
+            INSERT INTO devices VALUES ('11111111-1111-1111-1111-111111111111', 'Legacy', NULL, NULL, 1, 2, NULL, 0, 0, 1, 1);
+            """)
+        let before = try Data(contentsOf: fixture.databaseURL)
+
+        do {
+            _ = try SQLiteStore(url: fixture.databaseURL)
+            Issue.record("A legacy database must not open")
+        } catch StoreError.open(let message) {
+            #expect(message.contains("不支持"))
+        }
+
+        #expect(try Data(contentsOf: fixture.databaseURL) == before)
+        #expect(!FileManager.default.fileExists(atPath: fixture.databaseURL.path + "-wal"))
+        #expect(try fixture.int("PRAGMA user_version") == 0)
+        #expect(try fixture.int("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'") == 1)
+        #expect(try fixture.int("SELECT COUNT(*) FROM devices") == 1)
+    }
 }
 
-private final class LegacyStoreFixture {
+private final class StoreFixture {
     let root: URL
-    let visibleID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
-    let hiddenID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
     var databaseURL: URL { root.appending(path: "clickclick.sqlite") }
-    var backupURL: URL { root.appending(path: SQLiteStore.backupName) }
-    var calendar: Calendar {
+    var backupURL: URL { root.appending(path: "clickclick-v1-backup.sqlite") }
+    private var calendar: Calendar {
         var value = Calendar(identifier: .gregorian)
         value.timeZone = .autoupdatingCurrent
         return value
-    }
-    var descriptor: DeviceDescriptor {
-        DeviceDescriptor(
-            observedFingerprint: "fixture-device",
-            suggestedName: "Fixture",
-            manufacturer: "Test",
-            product: "Fixture",
-            vendorID: 1,
-            productID: 2,
-            transport: "USB",
-            isBuiltIn: false
-        )
     }
 
     init() throws {
@@ -531,213 +316,100 @@ private final class LegacyStoreFixture {
         try? FileManager.default.removeItem(at: root)
     }
 
-    func createCanonicalV1() throws {
-        try execute("""
-        CREATE TABLE devices (
-            id TEXT PRIMARY KEY, display_name TEXT NOT NULL, manufacturer TEXT, product TEXT,
-            vendor_id INTEGER NOT NULL, product_id INTEGER NOT NULL, transport TEXT,
-            is_built_in INTEGER NOT NULL, is_hidden INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL
-        );
-        CREATE TABLE device_aliases (
-            fingerprint TEXT PRIMARY KEY,
-            device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE
-        );
-        CREATE TABLE minute_device_counts (
-            bucket_start INTEGER NOT NULL, device_id TEXT NOT NULL, count INTEGER NOT NULL,
-            PRIMARY KEY (bucket_start, device_id)
-        );
-        CREATE TABLE hourly_device_counts (
-            bucket_start INTEGER NOT NULL, device_id TEXT NOT NULL, count INTEGER NOT NULL,
-            PRIMARY KEY (bucket_start, device_id)
-        );
-        CREATE TABLE daily_device_key_counts (
-            local_day TEXT NOT NULL, device_id TEXT NOT NULL, usage_page INTEGER NOT NULL,
-            usage INTEGER NOT NULL, count INTEGER NOT NULL,
-            PRIMARY KEY (local_day, device_id, usage_page, usage)
-        );
-        INSERT INTO devices VALUES
-            ('\(visibleID.uuidString)', 'Visible', 'Test', 'Visible', 1, 2, 'USB', 0, 0, 1, 1),
-            ('\(hiddenID.uuidString)', 'Hidden', 'Test', 'Hidden', 1, 3, 'USB', 0, 1, 1, 1);
-        INSERT INTO device_aliases VALUES
-            ('visible', '\(visibleID.uuidString)'), ('hidden', '\(hiddenID.uuidString)');
-        INSERT INTO daily_device_key_counts VALUES
-            ('2026-01-01', '\(visibleID.uuidString)', 7, 4, 3),
-            ('2026-01-15', '\(visibleID.uuidString)', 7, 4, 5),
-            ('2026-01-31', '\(visibleID.uuidString)', 7, 5, 7),
-            ('2026-02-01', '\(visibleID.uuidString)', 7, 4, 11),
-            ('2026-02-28', '\(visibleID.uuidString)', 7, 4, 13),
-            ('2026-01-15', '\(hiddenID.uuidString)', 7, 4, 17);
-        """)
-    }
-
-    func addAlignedLegacyTimeSeries() throws {
-        let visible: [(String, Int64)] = [
-            ("2026-01-01", 3), ("2026-01-15", 5), ("2026-01-31", 7),
-            ("2026-02-01", 11), ("2026-02-28", 13)
-        ]
-        for (day, count) in visible {
-            guard let date = date(day) else { throw LegacyFixtureError.sqlite("date") }
-            try execute("""
-                INSERT INTO minute_device_counts VALUES
-                    (\(TimeBuckets.minute(for: date)), '\(visibleID.uuidString)', \(count));
-                INSERT INTO hourly_device_counts VALUES
-                    (\(TimeBuckets.hour(for: date)), '\(visibleID.uuidString)', \(count));
-                """)
-        }
-        guard let hiddenDate = date("2026-01-15") else { throw LegacyFixtureError.sqlite("date") }
-        try execute("""
-            INSERT INTO minute_device_counts VALUES
-                (\(TimeBuckets.minute(for: hiddenDate)), '\(hiddenID.uuidString)', 17);
-            INSERT INTO hourly_device_counts VALUES
-                (\(TimeBuckets.hour(for: hiddenDate)), '\(hiddenID.uuidString)', 17);
-            """)
-    }
-
-    func date(_ localDay: String) -> Date? {
-        let values = localDay.split(separator: "-").compactMap { Int($0) }
-        guard values.count == 3 else { return nil }
-        return calendar.date(
-            from: DateComponents(year: values[0], month: values[1], day: values[2], hour: 12)
+    func descriptor(_ fingerprint: String, name: String) -> DeviceDescriptor {
+        DeviceDescriptor(
+            observedFingerprint: fingerprint,
+            suggestedName: name,
+            manufacturer: "Test",
+            product: name,
+            vendorID: 1,
+            productID: 2,
+            transport: "USB",
+            isBuiltIn: false
         )
+    }
+
+    /// Creates a visible device (39 counts) and a hidden one (17 counts) with
+    /// matching rows in every count table.
+    func seed(_ store: SQLiteStore) throws -> (visible: UUID, hidden: UUID) {
+        let visible = try store.resolveDevice(descriptor("visible", name: "Visible"))
+        let hidden = try store.resolveDevice(descriptor("hidden", name: "Hidden"))
+        try store.setDeviceHidden(id: hidden, hidden: true)
+        let rows: [(day: String, device: UUID, usage: UInt16, count: Int64)] = [
+            ("2026-01-01", visible, 4, 3), ("2026-01-15", visible, 4, 5), ("2026-01-31", visible, 5, 7),
+            ("2026-02-01", visible, 4, 11), ("2026-02-28", visible, 4, 13), ("2026-01-15", hidden, 4, 17)
+        ]
+        try store.apply(rows.map { row in
+            let date = try localNoon(row.day)
+            return CountIncrement(
+                minute: TimeBuckets.minute(for: date),
+                hour: TimeBuckets.hour(for: date),
+                localDay: row.day,
+                deviceID: row.device,
+                key: HIDKeyID(usagePage: 7, usage: row.usage),
+                count: row.count
+            )
+        })
+        return (visible, hidden)
+    }
+
+    func expectEveryCountTable(total: Int64, sourceLocation: SourceLocation = #_sourceLocation) throws {
+        for table in [
+            "minute_device_counts", "hourly_device_counts", "daily_device_key_counts",
+            "daily_device_counts", "monthly_device_key_counts", "device_total_counts"
+        ] {
+            #expect(
+                try int("SELECT COALESCE(SUM(count), 0) FROM \(table)") == total,
+                "\(table) total",
+                sourceLocation: sourceLocation
+            )
+        }
+    }
+
+    private func localNoon(_ localDay: String) throws -> Date {
+        let values = localDay.split(separator: "-").compactMap { Int($0) }
+        guard values.count == 3,
+              let date = calendar.date(
+                from: DateComponents(year: values[0], month: values[1], day: values[2], hour: 12)
+              ) else { throw FixtureError.sqlite("date") }
+        return date
     }
 
     func execute(_ sql: String) throws {
         var database: OpaquePointer?
         guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK else {
             defer { sqlite3_close(database) }
-            throw LegacyFixtureError.sqlite("open")
+            throw FixtureError.sqlite("open")
         }
         defer { sqlite3_close(database) }
         var error: UnsafeMutablePointer<CChar>?
         guard sqlite3_exec(database, sql, nil, nil, &error) == SQLITE_OK else {
             let message = error.map { String(cString: $0) } ?? "unknown"
             sqlite3_free(error)
-            throw LegacyFixtureError.sqlite(message)
+            throw FixtureError.sqlite(message)
         }
     }
 
     func int(_ sql: String) throws -> Int64 {
-        let database = try Self.readOnly(url: databaseURL)
-        defer { sqlite3_close(database) }
-        return try Self.int(sql, database: database)
-    }
-
-    static func readOnly(url: URL) throws -> OpaquePointer? {
         var database: OpaquePointer?
-        guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+        // Read-write so a WAL database can recreate its -shm once every store is closed.
+        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
             defer { sqlite3_close(database) }
-            throw LegacyFixtureError.sqlite("read-only open")
+            throw FixtureError.sqlite("open")
         }
-        return database
-    }
-
-    static func int(_ sql: String, database: OpaquePointer?) throws -> Int64 {
+        defer { sqlite3_close(database) }
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw LegacyFixtureError.sqlite("prepare")
+            throw FixtureError.sqlite("\(String(cString: sqlite3_errmsg(database))): \(sql)")
         }
         defer { sqlite3_finalize(statement) }
         guard sqlite3_step(statement) == SQLITE_ROW else {
-            throw LegacyFixtureError.sqlite("step")
+            throw FixtureError.sqlite("\(String(cString: sqlite3_errmsg(database))): \(sql)")
         }
         return sqlite3_column_int64(statement, 0)
     }
 }
 
-private enum LegacyFixtureError: Error {
+private enum FixtureError: Error {
     case sqlite(String)
-}
-
-private struct InjectedBackupRemovalError: Error {}
-
-private enum BackupRemovingMutation: String, CaseIterable {
-    case clearAll
-    case clearDevice
-    case deleteDevice
-
-    func prepareNoOp(fixture: LegacyStoreFixture) throws {
-        guard self == .clearAll else { return }
-        try fixture.execute("""
-            DELETE FROM minute_device_counts;
-            DELETE FROM hourly_device_counts;
-            DELETE FROM daily_device_key_counts;
-            DELETE FROM daily_device_counts;
-            DELETE FROM monthly_device_key_counts;
-            DELETE FROM device_total_counts;
-            UPDATE statistics_state SET canonical_signature = 'v1:0';
-            """)
-    }
-
-    func perform(on store: SQLiteStore, fixture: LegacyStoreFixture, noOp: Bool) throws {
-        switch self {
-        case .clearAll:
-            _ = try store.clearAllCounts()
-        case .clearDevice:
-            _ = try store.clearCounts(deviceID: noOp ? UUID() : fixture.visibleID)
-        case .deleteDevice:
-            _ = try store.deleteDevice(id: noOp ? UUID() : fixture.visibleID)
-        }
-    }
-}
-
-private enum DirtyCanonicalMutation: String, CaseIterable {
-    case merge
-    case mergeSame
-    case delete
-    case clearDevice
-    case clearMissing
-    case deleteMissing
-    case clearAll
-
-    func dirtyDeviceID(fixture: LegacyStoreFixture) -> UUID {
-        self == .clearDevice ? fixture.hiddenID : fixture.visibleID
-    }
-
-    func perform(on store: SQLiteStore, fixture: LegacyStoreFixture) throws -> Int64 {
-        switch self {
-        case .merge:
-            return try store.mergeDevice(source: fixture.hiddenID, target: fixture.visibleID)
-        case .mergeSame:
-            return try store.mergeDevice(source: fixture.visibleID, target: fixture.visibleID)
-        case .delete:
-            return try store.deleteDevice(id: fixture.hiddenID)
-        case .clearDevice:
-            return try store.clearCounts(deviceID: fixture.visibleID)
-        case .clearMissing:
-            return try store.clearCounts(deviceID: UUID())
-        case .deleteMissing:
-            return try store.deleteDevice(id: UUID())
-        case .clearAll:
-            return try store.clearAllCounts()
-        }
-    }
-
-    func expectReadModels(on store: SQLiteStore, fixture: LegacyStoreFixture) throws {
-        let expectedTotal: Int64
-        switch self {
-        case .merge:
-            expectedTotal = 60
-            #expect(try store.fetchDevices(connected: []).count == 1)
-            #expect(try store.fetchDevices(connected: [])[0].id == fixture.visibleID)
-        case .mergeSame, .clearMissing, .deleteMissing:
-            expectedTotal = 60
-            #expect(try store.fetchDevices(connected: []).count == 2)
-        case .delete:
-            expectedTotal = 43
-            #expect(try store.fetchDevices(connected: []).count == 1)
-            #expect(try store.fetchDevices(connected: [])[0].id == fixture.visibleID)
-        case .clearDevice:
-            expectedTotal = 21
-            #expect(
-                try store.fetchDevices(connected: []).first(where: { $0.id == fixture.visibleID })?.totalCount == 0
-            )
-        case .clearAll:
-            expectedTotal = 0
-        }
-        #expect(try fixture.int("SELECT COALESCE(SUM(count), 0) FROM daily_device_key_counts") == expectedTotal)
-        #expect(try fixture.int("SELECT COALESCE(SUM(count), 0) FROM daily_device_counts") == expectedTotal)
-        #expect(try fixture.int("SELECT COALESCE(SUM(count), 0) FROM monthly_device_key_counts") == expectedTotal)
-        #expect(try fixture.int("SELECT COALESCE(SUM(count), 0) FROM device_total_counts") == expectedTotal)
-    }
 }

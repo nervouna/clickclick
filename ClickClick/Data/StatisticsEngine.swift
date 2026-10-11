@@ -14,13 +14,6 @@ actor StatisticsEngine {
         reader = try StatisticsReader(databaseURL: databaseURL)
     }
 
-    @available(*, deprecated, message: "The application owns the flush cadence.")
-    func startPeriodicFlush() {
-        // Kept as a source-compatible no-op while callers move to an
-        // application-owned timer. Having a second timer here would recreate
-        // the refresh storm this split is intended to remove.
-    }
-
     func registerDevice(referenceID: UInt64, descriptor: DeviceDescriptor) throws -> UUID {
         let id = try store.resolveDevice(descriptor)
         connectedReferences[referenceID] = id
@@ -62,16 +55,14 @@ actor StatisticsEngine {
                 count: entry.value
             )
         }
-        let outcome = try store.applyWithOutcome(batch)
+        let revision = try store.apply(batch)
         pending.removeAll(keepingCapacity: true)
 
         let deltas = batch.map(FlushDelta.init)
         return FlushResult(
-            revision: outcome.revision,
+            revision: revision,
             deltas: deltas,
-            invalidation: outcome.reconciledCanonicalState
-                ? .full(revision: outcome.revision)
-                : .counts(revision: outcome.revision, deltas: deltas)
+            invalidation: .counts(revision: revision, deltas: deltas)
         )
     }
 
@@ -85,40 +76,8 @@ actor StatisticsEngine {
         return .full(revision: after)
     }
 
-    func currentRevision() throws -> Int64 {
-        try store.revision()
-    }
-
-    // Compatibility reads delegate to the independent reader connection. They
-    // no longer hold the writer actor or block input accumulation.
     func dashboard() async throws -> RevisionedDashboardSnapshot {
-        return try await dashboardReader.dashboard(connected: Set(connectedReferences.values))
-    }
-
-    func trend(
-        granularity: TrendGranularity,
-        from: Date,
-        to: Date,
-        deviceID: UUID?
-    ) async throws -> [TrendPoint] {
-        _ = try flush()
-        return try await reader.trend(
-            granularity: granularity,
-            from: from,
-            to: to,
-            deviceID: deviceID,
-            calendar: .autoupdatingCurrent
-        )
-    }
-
-    func keyCounts(from: Date, to: Date, deviceID: UUID?) async throws -> [KeyCount] {
-        _ = try flush()
-        return try await reader.keyCounts(
-            from: from,
-            to: to,
-            deviceID: deviceID,
-            calendar: .autoupdatingCurrent
-        )
+        try await dashboardReader.dashboard(connected: Set(connectedReferences.values))
     }
 
     @discardableResult

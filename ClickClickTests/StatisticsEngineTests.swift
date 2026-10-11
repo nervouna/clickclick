@@ -15,9 +15,11 @@ struct StatisticsEngineTests {
         await engine.record(deviceID: second, key: HIDKeyID(usagePage: 0x07, usage: 0xE1), at: date)
         try await engine.flush()
 
-        let trend = try await engine.trend(granularity: .minute, from: date.addingTimeInterval(-60), to: date.addingTimeInterval(60), deviceID: nil)
-        #expect(trend.reduce(0) { $0 + $1.count } == 3)
-        #expect(Set(trend.map(\.deviceID)) == [first, second])
+        let snapshot = try await engine.reader.snapshot(
+            for: StatisticsQuery(granularity: .minute, deviceID: nil, now: date)
+        )
+        #expect(snapshot.trend.reduce(0) { $0 + $1.count } == 3)
+        #expect(Set(snapshot.trend.map(\.deviceID)) == [first, second])
     }
 
     @Test func mergesCountsAndAliases() async throws {
@@ -41,52 +43,14 @@ struct StatisticsEngineTests {
         try await engine.flush()
         try await engine.performMaintenance()
 
-        let queryStart = old.addingTimeInterval(-3_600)
-        let minute = try await engine.trend(granularity: .minute, from: queryStart, to: Date(), deviceID: nil)
-        let hour = try await engine.trend(granularity: .hour, from: queryStart, to: Date(), deviceID: nil)
-        #expect(minute.isEmpty)
-        #expect(hour.reduce(0) { $0 + $1.count } == 1)
-    }
-
-    @Test func repairsReservedKeyCountsAndAggregateTotals() async throws {
-        let fixture = try Fixture()
-        let store = try SQLiteStore(url: fixture.databaseURL)
-        let descriptor = fixture.descriptor(fingerprint: "repair", name: "Repair")
-        let device = try store.resolveDevice(descriptor)
-        let date = Date()
-        try store.apply([
-            CountIncrement(
-                minute: TimeBuckets.minute(for: date),
-                hour: TimeBuckets.hour(for: date),
-                localDay: TimeBuckets.localDay(for: date),
-                deviceID: device,
-                key: HIDKeyID(usagePage: 0x07, usage: 0),
-                count: 4
-            ),
-            CountIncrement(
-                minute: TimeBuckets.minute(for: date),
-                hour: TimeBuckets.hour(for: date),
-                localDay: TimeBuckets.localDay(for: date),
-                deviceID: device,
-                key: HIDKeyID(usagePage: 0x07, usage: 0x04),
-                count: 5
-            )
-        ])
-        _ = try SQLiteStore(url: fixture.databaseURL)
-        let repaired = try SQLiteStore(url: fixture.databaseURL)
-        let keys = try repaired.keyCounts(
-            fromDay: TimeBuckets.localDay(for: date),
-            toDay: TimeBuckets.localDay(for: date),
-            deviceID: device
+        let minute = try await engine.reader.snapshot(
+            for: StatisticsQuery(granularity: .minute, deviceID: nil, now: old)
         )
-        let trend = try repaired.trendRows(
-            from: date.addingTimeInterval(-60),
-            to: date.addingTimeInterval(60),
-            minute: true,
-            deviceID: device
+        let hour = try await engine.reader.snapshot(
+            for: StatisticsQuery(granularity: .hour, deviceID: nil, now: old)
         )
-        #expect(keys == [KeyCount(key: HIDKeyID(usagePage: 0x07, usage: 0x04), count: 5)])
-        #expect(trend.reduce(0) { $0 + $1.3 } == 5)
+        #expect(minute.trend.isEmpty)
+        #expect(hour.trend.reduce(0) { $0 + $1.count } == 1)
     }
 
     @Test func engineRejectsReservedUsagesAtStorageBoundary() async throws {
@@ -101,36 +65,6 @@ struct StatisticsEngineTests {
         try await engine.flush()
         let snapshot = (try await engine.dashboard()).snapshot
         #expect(snapshot.todayTotal == 0)
-    }
-
-    @Test func flushPublishesFullInvalidationAfterReconcilingLegacyWriterDrift() async throws {
-        let fixture = try Fixture()
-        let engine = try StatisticsEngine(databaseURL: fixture.databaseURL)
-        let device = try await engine.registerDevice(
-            referenceID: 1,
-            descriptor: fixture.descriptor(fingerprint: "dirty-flush", name: "Dirty Flush")
-        )
-        let key = HIDKeyID(usagePage: 0x07, usage: 0x04)
-        let date = Date()
-        await engine.record(deviceID: device, key: key, at: date)
-        let firstFlush = try #require(try await engine.flush())
-        try fixture.executeSQL(
-            "UPDATE daily_device_key_counts SET count = count + 4 "
-                + "WHERE device_id = '\(device.uuidString)' AND local_day = '\(TimeBuckets.localDay(for: date))';"
-        )
-        await engine.record(deviceID: device, key: key, at: date)
-
-        let reconciledFlush = try #require(try await engine.flush())
-
-        #expect(reconciledFlush.revision == firstFlush.revision + 1)
-        #expect(reconciledFlush.deltas.reduce(Int64.zero) { $0 + $1.count } == 1)
-        #expect(reconciledFlush.invalidation.scope == .full)
-        #expect((try await engine.dashboard()).snapshot.todayTotal == 6)
-
-        await engine.record(deviceID: device, key: key, at: date)
-        let cleanFlush = try #require(try await engine.flush())
-        #expect(cleanFlush.revision == reconciledFlush.revision + 1)
-        #expect(cleanFlush.invalidation.scope == .counts)
     }
 
     @Test func failedDestructiveMutationsRetainPendingCountsForTheNextFlush() async throws {
