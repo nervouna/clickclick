@@ -14,6 +14,18 @@ ClickClick（咔咔咔咔计数器）是一款 macOS 菜单栏输入计数器。
 Requirements: macOS 26+, Xcode 26+, Apple Silicon.
 
 ```sh
-xcodegen generate
 xcodebuild -project ClickClick.xcodeproj -scheme ClickClick -destination 'platform=macOS' test
+```
+
+### Local install
+
+Archive with the Developer ID identity, quit the running app, then replace the copy in `/Applications`. Signing with the same identity keeps the existing Input Monitoring grant.
+
+```sh
+xcodebuild -project ClickClick.xcodeproj -scheme ClickClick -configuration Release \
+  -archivePath build/ClickClick.xcarchive archive \
+  CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Developer ID Application" \
+  PROVISIONING_PROFILE_SPECIFIER= OTHER_CODE_SIGN_FLAGS=--timestamp
+rm -rf /Applications/ClickClick.app
+ditto build/ClickClick.xcarchive/Products/Applications/ClickClick.app /Applications/ClickClick.app
 ```
