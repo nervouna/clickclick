@@ -101,7 +101,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
-    @objc private func clockOrWakeDidChange() {
-        Task { await model?.clockOrWakeDidChange() }
+    // Foundation posts NSCalendarDayChanged and NSSystemTimeZoneDidChange on a
+    // background queue, so the selector must not assume main-actor isolation.
+    @objc private nonisolated func clockOrWakeDidChange() {
+        Task { @MainActor in await self.model?.clockOrWakeDidChange() }
     }
 }
