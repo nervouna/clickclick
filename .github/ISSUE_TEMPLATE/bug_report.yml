@@ -1,0 +1,57 @@
+name: Bug report
+description: Something in ClickClick does not work as described
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you did and what went wrong, such as a keyboard that is not counted or counts that look wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The keyboards involved (built-in, USB, Bluetooth, model) and the steps that show it.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release (for example 0.1.1) or the commit you built.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: macOS version and Mac model
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      options:
+        - Key counting or keyboard detection
+        - Menu bar
+        - Detailed statistics
+        - Keyboards page (rename, merge, hide, delete)
+        - Settings or launch at login
+        - Input Monitoring permission
+        - Build
+        - Docs
+    validations:
+      required: true
+  - type: textarea
+    id: fix
+    attributes:
+      label: Suggested fix
+      description: Optional. If you know where the cause is, say so.
