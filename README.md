@@ -4,7 +4,7 @@
 ![macOS 26+](https://img.shields.io/badge/macOS-26%2B-lightgrey)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-<!-- banner -->
+![ClickClick](docs/images/banner.jpg)
 
 ClickClick (咔咔咔咔计数器) is a macOS menu bar app that counts key presses on each physical keyboard, the built-in one and every external one, through CoreHID. It stores only counts, on your Mac, and shows them as trends and a key heatmap.
 
